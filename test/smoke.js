@@ -112,6 +112,26 @@ function staticChecks() {
   ok(store.list().filter((p) => p.name.indexOf('imp1') >= 0).length === 1, '导入的环境已落库');
 
   for (const id of [cloneSrc.id, copy.id, imported[0].id]) store.remove(id);
+
+  /* CLI 工具：预设 / 代理串 */
+  const cliutil = require('../src/cliutil');
+  ok(cliutil.getPreset('us-shop').timezone === 'America/New_York', '预设 us-shop 的时区是纽约');
+  ok(cliutil.getPreset('jp-shop').languages[0] === 'ja-JP', '预设 jp-shop 的主语言是 ja-JP');
+  let threw = false;
+  try {
+    cliutil.getPreset('nope');
+  } catch {
+    threw = true;
+  }
+  ok(threw, '未知预设会报错');
+
+  const px1 = cliutil.parseProxyLine('http://u:p@1.2.3.4:8080');
+  ok(px1 && px1.type === 'http' && px1.host === '1.2.3.4' && px1.password === 'p', '代理串解析：URL 形式');
+  const px2 = cliutil.parseProxyLine('socks5://1.2.3.4:1080');
+  ok(px2 && px2.type === 'socks5' && px2.port === '1080', '代理串解析：socks5 URL');
+  const px3 = cliutil.parseProxyLine('1.2.3.4:8080:user:pass');
+  ok(px3 && px3.username === 'user' && px3.password === 'pass', '代理串解析：host:port:user:pass');
+  ok(cliutil.parseProxies('# 注释\nhttp://a.b:1\n\n1.2.3.4:80').length === 2, '代理文件：忽略注释和空行');
 }
 
 /* ---------------------------- 2. 代理中继自检 ---------------------------- */

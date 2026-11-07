@@ -73,19 +73,9 @@ function serveStatic(req, res, pathname) {
   res.end(body);
 }
 
-/** 密码只写不读：接口只回 hasPassword，前端留空表示"不修改已保存的密码" */
-function publicProfile(profile) {
-  const p = { ...profile };
-  if (p.proxy && typeof p.proxy === 'object') {
-    const { password, ...rest } = p.proxy;
-    p.proxy = { ...rest, hasPassword: !!password };
-  }
-  return p;
-}
-
 function withRunning(profile) {
   const info = launcher.getRunning(profile.id);
-  return { ...publicProfile(profile), running: !!info, instance: info };
+  return { ...store.publicProfile(profile), running: !!info, instance: info };
 }
 
 function createServer() {

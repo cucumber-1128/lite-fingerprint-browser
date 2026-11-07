@@ -85,6 +85,31 @@ npm run client:build   # → src-tauri/target/release/bundle/nsis/LiteFingerprin
 
 本机装不了工具链的话，可以走 GitHub Actions：在 Actions 里手动跑 `build-client`，或推一个 `v*` tag，产物在 Artifacts 里（`LiteFingerprint_*_x64-setup.exe`）。
 
+## 给 agent 用（一句话配环境）
+
+所有操作都有 CLI 版本，并且**全部支持 `--json`**（stdout 只有 JSON，退出码 0/1，不弹交互提示）。详细的命令表和返回结构见 [AGENTS.md](AGENTS.md)，这里是几个典型的一句：
+
+```bash
+# 建 5 个美国店铺，代理一行一个
+node src/index.js create --preset us-shop --name 美国店铺 --proxies proxies.txt --json
+
+# 把这一组全开起来 / 全关掉
+node src/index.js launch --group 美国店铺 --json
+node src/index.js stop   --group 美国店铺 --json
+
+# 读真实指纹 / 测代理出口
+node src/index.js probe <id> --json
+node src/index.js proxy-test <id> --json
+
+# 备份与恢复（不含代理密码）
+node src/index.js export backup.json --json
+node src/index.js import backup.json --json
+```
+
+内置地区预设：`us-shop` `us-west` `uk-shop` `de-shop` `jp-shop` `tw-shop` `cn-shop` `mac-us`（`presets --json` 可列）。预设只锁「和地区绑定」的时区/语言/平台，屏幕、CPU、GPU 仍然按环境随机，保证每个指纹都不一样。
+
+代理和环境是**一对一**的：`--count` 超过代理条数会直接报错，不会拿同一个出口 IP 顶两个环境。
+
 ## 它到底改了哪些指纹
 
 分两层做，这是关键设计：

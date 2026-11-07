@@ -316,6 +316,16 @@ function importAll(items) {
   return out;
 }
 
+/** 对外暴露：代理密码只写不读，换成 hasPassword */
+function publicProfile(profile) {
+  const p = { ...profile };
+  if (p.proxy && typeof p.proxy === 'object') {
+    const { password, ...rest } = p.proxy;
+    p.proxy = { ...rest, hasPassword: !!password };
+  }
+  return p;
+}
+
 module.exports = {
   ROOT,
   DATA,
@@ -327,6 +337,7 @@ module.exports = {
   clone,
   exportAll,
   importAll,
+  publicProfile,
   profileDir,
   randomFingerprint,
   TIMEZONES,
