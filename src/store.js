@@ -5,7 +5,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const ROOT = path.resolve(__dirname, '..');
-const DATA = path.join(ROOT, 'data');
+// 数据目录可用 FB_DATA 覆盖：测试、双开、放移动硬盘都用得上
+const DATA = process.env.FB_DATA ? path.resolve(process.env.FB_DATA) : path.join(ROOT, 'data');
 const FILE = path.join(DATA, 'profiles.json');
 const PROFILE_ROOT = path.join(DATA, 'profiles');
 
@@ -39,10 +40,11 @@ const SCREEN_POOL = [
 ];
 
 const CPU_POOL = [4, 8, 8, 12, 16];
-const MEM_POOL = [4, 8, 8, 16];
+// deviceMemory 的规范上限就是 8，真 Chrome 永远不会报 16
+const MEM_POOL = [4, 8, 8, 8];
 
 const TIMEZONES = {
-  'zh-CN': ['Asia/Shanghai', 'Asia/Chongqing'],
+  'zh-CN': ['Asia/Shanghai'],
   'zh-TW': ['Asia/Taipei'],
   'en-US': ['America/New_York', 'America/Chicago', 'America/Los_Angeles'],
   'en-GB': ['Europe/London'],
@@ -54,6 +56,13 @@ const TIMEZONES = {
 
 function pick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
+}
+
+/** 内存值归一化：deviceMemory 只可能是 1/2/4/8（上限 8），其余值按 8 处理 */
+function clampMemory(v) {
+  const n = Number(v);
+  if (!isFinite(n) || n <= 0) return 8;
+  return Math.min(8, Math.max(1, n));
 }
 
 function uid() {
@@ -69,11 +78,25 @@ function ensure() {
 
 function load() {
   ensure();
+  let raw;
   try {
-    const db = JSON.parse(fs.readFileSync(FILE, 'utf8'));
+    raw = fs.readFileSync(FILE, 'utf8');
+  } catch {
+    return { version: 1, profiles: [] };
+  }
+  try {
+    const db = JSON.parse(raw);
     if (!Array.isArray(db.profiles)) db.profiles = [];
     return db;
-  } catch {
+  } catch (e) {
+    // 坏文件先备份再放空库：否则下一次 save 会把所有环境覆盖掉
+    const backup = FILE + '.corrupt-' + Date.now();
+    try {
+      fs.copyFileSync(FILE, backup);
+    } catch {
+      /* ignore */
+    }
+    console.warn('[store] profiles.json 解析失败，已备份到 ' + backup + '：' + e.message);
     return { version: 1, profiles: [] };
   }
 }
@@ -88,7 +111,8 @@ function save(db) {
 /** 生成一套随机但自洽的指纹 */
 function randomFingerprint(platform) {
   const plat = platform || pick(['win', 'win', 'win', 'mac']);
-  const screen = pick(SCREEN_POOL);
+  // 必须拷贝：下面会按平台改写屏幕，直接改池子里的对象会污染后续所有环境
+  const screen = { ...pick(SCREEN_POOL) };
   const gl = pick(plat === 'mac' ? WEBGL_MAC : WEBGL_POOL);
   const locale = plat === 'mac' ? pick(['en-US', 'zh-CN']) : pick(['zh-CN', 'zh-CN', 'en-US']);
   const langMap = {
@@ -172,9 +196,16 @@ function create(input = {}) {
   // 允许覆盖任意字段
   for (const [k, v] of Object.entries(input)) {
     if (k === 'id') continue;
-    if (k === 'proxy' && v && typeof v === 'object') p.proxy = { ...p.proxy, ...v };
-    else if (k === 'screen' && v && typeof v === 'object') p.screen = { ...p.screen, ...v };
-    else p[k] = v;
+    if (k === 'proxy' && v && typeof v === 'object') {
+      const { hasPassword, ...rest } = v; // 只读派生字段，不落库
+      p.proxy = { ...p.proxy, ...rest };
+    } else if (k === 'screen' && v && typeof v === 'object') {
+      p.screen = { ...p.screen, ...v };
+    } else if (k === 'deviceMemory') {
+      p.deviceMemory = clampMemory(v);
+    } else {
+      p[k] = v;
+    }
   }
   p.updatedAt = new Date().toISOString();
   db.profiles.push(p);
@@ -189,9 +220,16 @@ function update(id, patch = {}) {
   if (!p) return null;
   for (const [k, v] of Object.entries(patch)) {
     if (k === 'id' || k === 'createdAt') continue;
-    if (k === 'proxy' && v && typeof v === 'object') p.proxy = { ...p.proxy, ...v };
-    else if (k === 'screen' && v && typeof v === 'object') p.screen = { ...p.screen, ...v };
-    else p[k] = v;
+    if (k === 'proxy' && v && typeof v === 'object') {
+      const { hasPassword, ...rest } = v; // 只读派生字段，不落库
+      p.proxy = { ...p.proxy, ...rest };
+    } else if (k === 'screen' && v && typeof v === 'object') {
+      p.screen = { ...p.screen, ...v };
+    } else if (k === 'deviceMemory') {
+      p.deviceMemory = clampMemory(v);
+    } else {
+      p[k] = v;
+    }
   }
   p.updatedAt = new Date().toISOString();
   save(db);

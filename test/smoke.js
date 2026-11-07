@@ -7,6 +7,11 @@
 const net = require('node:net');
 const http = require('node:http');
 const path = require('node:path');
+const os = require('node:os');
+const fs = require('node:fs');
+
+// 测试不碰生产数据：整个 data 目录指到临时目录
+process.env.FB_DATA = process.env.FB_DATA || path.join(os.tmpdir(), 'fb-smoke-' + process.pid);
 
 const store = require('../src/store');
 const launcher = require('../src/launch');
@@ -32,6 +37,15 @@ function eq(actual, expected, label) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** 收掉临时数据目录（浏览器都关掉之后才能删干净） */
+function cleanupData() {
+  try {
+    fs.rmSync(process.env.FB_DATA, { recursive: true, force: true });
+  } catch {
+    /* 被占用就留着，反正下次是新的临时目录 */
+  }
+}
+
 /* ----------------------------- 1. 静态自检 ----------------------------- */
 
 function staticChecks() {
@@ -43,7 +57,7 @@ function staticChecks() {
   const profile = {
     seed: 'testseed',
     hardwareConcurrency: 12,
-    deviceMemory: 16,
+    deviceMemory: 8,
     maxTouchPoints: 0,
     screen: { width: 2560, height: 1440, availHeight: 1400, colorDepth: 24, pixelRatio: 1 },
     webglVendor: 'Google Inc. (AMD)',
@@ -62,7 +76,7 @@ function staticChecks() {
   }
   ok(!src.includes('__CFG__'), '__CFG__ 占位符已被替换');
   ok(src.includes('2560') && src.includes('Radeon RX 6600'), '指纹参数已写入脚本');
-  ok(launcher.buildUserAgent(profile, '141.0.7390.55').includes('Chrome/141.0.7390.55'), 'UA 跟随真实内核版本');
+  ok(launcher.buildUserAgent(profile, '141.0.7390.55').includes('Chrome/141.0.0.0'), 'UA 用 Chrome 的 reduction 形态（完整版本只在 UA-CH 里）');
 }
 
 /* ---------------------------- 2. 代理中继自检 ---------------------------- */
@@ -334,7 +348,7 @@ async function browserChecks() {
     locale: 'en-US',
     languages: ['en-US', 'en'],
     hardwareConcurrency: 12,
-    deviceMemory: 16,
+    deviceMemory: 8,
     screen: { width: 2560, height: 1440, availHeight: 1400, colorDepth: 24, pixelRatio: 1 },
     webglVendor: 'Google Inc. (AMD)',
     webglRenderer: 'ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)',
@@ -383,7 +397,7 @@ async function browserChecks() {
     eq(ra.locale, 'en-US', 'Locale 被改为 en-US');
     eq(JSON.stringify(ra.languages), JSON.stringify(['en-US', 'en']), 'navigator.languages 被覆盖');
     eq(ra.hardwareConcurrency, 12, 'CPU 核数被改为 12');
-    eq(ra.deviceMemory, 16, '设备内存被改为 16GB');
+    eq(ra.deviceMemory, 8, '设备内存被改为 8GB（deviceMemory 的规范上限）');
     eq(ra.screen.width, 2560, 'screen.width = 2560');
     eq(ra.screen.height, 1440, 'screen.height = 1440');
     eq(ra.webglVendor, 'Google Inc. (AMD)', 'WebGL 厂商被覆盖');
@@ -530,8 +544,10 @@ async function headerChecks() {
   if (failures.length) {
     console.log('\x1b[31m失败 ' + failures.length + ' 项\x1b[0m，通过 ' + pass + ' 项');
     for (const f of failures) console.log('  · ' + f);
+    cleanupData();
     process.exit(1);
   }
   console.log('\x1b[32m全部通过\x1b[0m（' + pass + ' 项断言）');
+  cleanupData();
   process.exit(0);
 })();

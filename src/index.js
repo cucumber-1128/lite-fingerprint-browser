@@ -41,6 +41,13 @@ function openBrowser(url) {
 async function main() {
   const cmd = argv[0];
 
+  // 控制台重启后，之前开着的浏览器还能被重新接管（不然会显示"已停止"且关不掉）
+  try {
+    await launcher.reattach();
+  } catch {
+    /* 接管失败不影响启动 */
+  }
+
   if (cmd === 'list') {
     const rows = store.list();
     if (!rows.length) {
@@ -61,7 +68,9 @@ async function main() {
     const info = await launcher.launch(id);
     console.log('已启动，PID=' + info.pid + '，DevTools 端口=' + info.devtoolsPort);
     console.log('UA: ' + info.ua);
-    return;
+    // 浏览器已经 detached 起来了，CLI 到这儿就该退出；
+    // 否则子进程句柄和 CDP 的长连接会把事件循环一直挂住
+    process.exit(0);
   }
 
   if (cmd === 'stop-all') {

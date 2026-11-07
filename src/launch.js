@@ -5,6 +5,7 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { CDP } = require('./cdp');
 const { findBrowser } = require('./browser');
@@ -52,10 +53,21 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  */
 let probeUrl = null;
 let probeServer = null;
+let probeWaiters = [];
 async function ensureProbePage() {
   if (probeUrl) return probeUrl;
   const http = require('node:http');
   probeServer = http.createServer((req, res) => {
+    // 顺手记下请求头：Client Hints 的真值就是从这里读的
+    const waiters = probeWaiters;
+    probeWaiters = [];
+    for (const w of waiters) {
+      try {
+        w(req.headers || {});
+      } catch {
+        /* ignore */
+      }
+    }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
     res.end('<!doctype html><meta charset="utf-8"><title>fingerprint probe</title><body></body>');
   });
@@ -66,55 +78,236 @@ async function ensureProbePage() {
   return probeUrl;
 }
 
-/* ------------------------------- 指纹参数组装 ------------------------------- */
-
-function buildUserAgent(profile, fullVersion) {
-  if (profile.userAgentMode === 'custom' && profile.userAgentCustom) return profile.userAgentCustom;
-  const p = PLATFORM_UA[profile.platform] || PLATFORM_UA.win;
-  return (
-    'Mozilla/5.0 (' +
-    p.ua +
-    ') AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' +
-    fullVersion +
-    ' Safari/537.36'
-  );
+/** 等下一次到达探针页的请求（用于拿浏览器真实发出的请求头） */
+function onceProbeRequest(timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      resolve(null);
+    }, timeoutMs);
+    probeWaiters.push((headers) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(headers);
+    });
+  });
 }
 
-function buildUaMetadata(profile, fullVersion) {
+/* --------------------------- Client Hints 真值 --------------------------- */
+/**
+ * `sec-ch-ua` 里的 GREASE 品牌名、版本号、**顺序** 每个 Chrome 版本都不一样，
+ * 自己拼一套必然和真机对不上（实测 Chrome 156 是 `"Not:A-Brand";v="8", "Chromium";v="156",
+ * "Google Chrome";v="156"`，而手拼的是反过来的顺序 + `Not_A Brand";v="24"`）。
+ * 所以启动时开一个后台标签页请求本地探针，把浏览器自己发的头和高熵值读回来，
+ * 每个 Chrome 版本只读一次，缓存在 data/client-hints.json。
+ */
+const HINTS_FILE = path.join(store.DATA, 'client-hints.json');
+
+let hintsCache = null;
+try {
+  const cached = JSON.parse(fs.readFileSync(HINTS_FILE, 'utf8'));
+  if (cached && cached.key && cached.value) hintsCache = cached;
+} catch {
+  /* 没有缓存就算了 */
+}
+
+function parseBrands(header) {
+  const out = [];
+  const re = /"([^"]+)"\s*;\s*v\s*=\s*"([^"]*)"/g;
+  let m;
+  while ((m = re.exec(String(header || '')))) out.push({ brand: m[1], version: m[2] });
+  return out;
+}
+
+const UA_CH_EXPR = `(async () => {
+  if (!navigator.userAgentData) return '{}';
+  try {
+    return JSON.stringify(await navigator.userAgentData.getHighEntropyValues(
+      ['platform', 'platformVersion', 'architecture', 'bitness', 'model', 'uaFullVersion', 'wow64']
+    ));
+  } catch (e) {
+    return '{}';
+  }
+})()`;
+
+/** 在（还没有被覆写的）新标签页里读一次真实 UA-CH，读完关掉 */
+async function fetchRealHints(cdp) {
+  const url = await ensureProbePage();
+  let targetId = null;
+  let sessionId = null;
+  try {
+    // background: 不抢焦点；老协议不认这个参数就退回去
+    let created;
+    try {
+      created = await cdp.send('Target.createTarget', { url: 'about:blank', background: true });
+    } catch {
+      created = await cdp.send('Target.createTarget', { url: 'about:blank' });
+    }
+    targetId = created.targetId;
+    sessionId = (await cdp.send('Target.attachToTarget', { targetId, flatten: true })).sessionId;
+    await cdp.try_('Page.enable', {}, sessionId);
+
+    const headersP = onceProbeRequest(6000);
+    const loadedP = new Promise((resolve) => {
+      const onLoad = (params, sid) => {
+        if (sid !== sessionId) return;
+        cdp.removeListener('Page.loadEventFired', onLoad);
+        resolve(true);
+      };
+      cdp.on('Page.loadEventFired', onLoad);
+      setTimeout(() => {
+        cdp.removeListener('Page.loadEventFired', onLoad);
+        resolve(false);
+      }, 6000);
+    });
+    await cdp.send('Page.navigate', { url }, sessionId);
+    const headers = await headersP;
+    await loadedP;
+    if (!headers) return null;
+
+    let high = {};
+    try {
+      const res = await cdp.send(
+        'Runtime.evaluate',
+        { expression: UA_CH_EXPR, awaitPromise: true, returnByValue: true },
+        sessionId
+      );
+      if (res && res.result && typeof res.result.value === 'string') high = JSON.parse(res.result.value);
+    } catch {
+      /* 高熵值拿不到不致命，用下面的兜底 */
+    }
+
+    return {
+      userAgent: headers['user-agent'] || '',
+      brands: parseBrands(headers['sec-ch-ua']),
+      platformVersion: high.platformVersion || '',
+      architecture: high.architecture || '',
+      bitness: high.bitness || '',
+      model: high.model || '',
+      wow64: high.wow64 === true,
+      fullVersion: high.uaFullVersion || '',
+    };
+  } finally {
+    if (targetId) {
+      try {
+        await cdp.send('Target.closeTarget', { targetId });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/** 取真实 UA-CH（带进程内 + 磁盘缓存，Chrome 不升级就不重复开标签页） */
+async function getRealHints(cdp, product) {
+  const key = String(product || '');
+  if (hintsCache && hintsCache.key === key) return hintsCache.value;
+  let value = null;
+  try {
+    value = await fetchRealHints(cdp);
+  } catch {
+    value = null;
+  }
+  if (value && key) {
+    hintsCache = { key, value };
+    try {
+      fs.mkdirSync(store.DATA, { recursive: true });
+      fs.writeFileSync(HINTS_FILE, JSON.stringify(hintsCache, null, 2), 'utf8');
+    } catch {
+      /* 缓存写不进去不影响启动 */
+    }
+  }
+  return value;
+}
+
+/* ------------------------------- 指纹参数组装 ------------------------------- */
+
+/**
+ * 拼 UA。
+ * 真 Chrome 从 110 起就把 UA 做了 reduction：请求头里只有 `Chrome/<major>.0.0.0`，
+ * 完整版本号只出现在 UA-CH（`uaFullVersion`）里。所以这里绝不能塞完整版本号——
+ * 那会让"用真内核"反而变成最明显的特征。直接用浏览器自己报的 UA 当模板，只换平台段。
+ */
+function buildUserAgent(profile, fullVersion, hints) {
+  if (profile.userAgentMode === 'custom' && profile.userAgentCustom) return profile.userAgentCustom;
   const p = PLATFORM_UA[profile.platform] || PLATFORM_UA.win;
   const major = String(fullVersion).split('.')[0];
+
+  let ua = String((hints && hints.userAgent) || '').trim();
+  ua = ua
+    .replace(/Chrome\/[0-9.]+/g, 'Chrome/' + major + '.0.0.0')
+    .replace(/Edg\/[0-9.]+/g, 'Edg/' + major + '.0.0.0');
+  if (!ua || ua.indexOf('Chrome/') < 0) {
+    ua =
+      'Mozilla/5.0 (' +
+      p.ua +
+      ') AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' +
+      major +
+      '.0.0.0 Safari/537.36';
+  }
+  // 只替换平台段（UA 里只有一对括号）
+  return ua.replace(/\([^()]*\)/, '(' + p.ua + ')');
+}
+
+/**
+ * UA-CH 元数据：品牌列表用浏览器自己发的（GREASE 名字、版本、顺序都对），
+ * 平台相关的高熵值按声明的平台替换；声明平台==真实平台时连架构/系统版本都沿用真值，
+ * 这样在 Windows 上跑 Windows 指纹时，服务端看到的和真机逐字段一致。
+ */
+function buildUaMetadata(profile, fullVersion, hints) {
+  const p = PLATFORM_UA[profile.platform] || PLATFORM_UA.win;
+  const REAL_PLATFORM = { win32: 'win', darwin: 'mac', linux: 'linux' }[process.platform] || 'linux';
+  const native = profile.platform === REAL_PLATFORM;
+  const major = String(fullVersion).split('.')[0];
+  const full = (hints && hints.fullVersion) || fullVersion;
+
+  const real = hints && Array.isArray(hints.brands) ? hints.brands.filter((b) => b && b.brand) : [];
+  const brands = real.length
+    ? real
+    : [
+        { brand: 'Not:A-Brand', version: '8' },
+        { brand: 'Chromium', version: major },
+        { brand: 'Google Chrome', version: major },
+      ];
+
+  // fullVersionList：真机只列真品牌（不含 GREASE），版本用完整版本号
+  const fullVersionList = brands
+    .filter((b) => !/not.?a.?brand/i.test(String(b.brand)))
+    .map((b) => ({ brand: b.brand, version: full }));
+
   return {
-    brands: [
-      { brand: 'Google Chrome', version: major },
-      { brand: 'Chromium', version: major },
-      { brand: 'Not_A Brand', version: '24' },
-    ],
-    fullVersionList: [
-      { brand: 'Google Chrome', version: fullVersion },
-      { brand: 'Chromium', version: fullVersion },
-      { brand: 'Not_A Brand', version: '24.0.0.0' },
-    ],
-    fullVersion,
+    brands,
+    fullVersionList,
+    fullVersion: full,
     platform: p.chPlatform,
-    platformVersion: p.chVersion,
-    architecture: p.arch,
-    model: '',
+    platformVersion: (native && hints && hints.platformVersion) || p.chVersion,
+    architecture: (native && hints && hints.architecture) || p.arch,
+    model: (native && hints && hints.model) || '',
     mobile: false,
-    bitness: p.bitness,
-    wow64: false,
+    bitness: (native && hints && hints.bitness) || p.bitness,
+    wow64: native && hints ? hints.wow64 === true : false,
   };
 }
 
-/** 读取并校验注入脚本，把 __CFG__ 替换成该环境的指纹参数 */
-function buildInjectionSource(profile, fullVersion) {
-  const tpl = fs.readFileSync(PATCH_FILE, 'utf8');
+/** 按 seed 派生一个"像家用网段"的私网地址：所有环境共用一个 192.168.1.88 反而是聚类信号 */
+function deriveFakeIp(seed) {
+  const h = crypto.createHash('sha256').update(String(seed)).digest();
+  return '192.168.' + (20 + (h[0] % 200)) + '.' + (20 + (h[1] % 200));
+}
+
+/** 组装注入脚本用的配置（probe 的期望值也用它，避免两处各算一套） */
+function buildConfig(profile) {
   const REAL_PLATFORM = { win32: 'win', darwin: 'mac', linux: 'linux' }[process.platform] || 'linux';
-  const cfg = {
+  return {
     seed: profile.seed || 'seed',
     platform: profile.platform || 'win',
     realPlatform: REAL_PLATFORM,
     hardwareConcurrency: Number(profile.hardwareConcurrency) || 8,
-    deviceMemory: Number(profile.deviceMemory) || 8,
+    // 规范上限就是 8：真 Chrome 永远不会报 16，报 16 等于自曝
+    deviceMemory: Math.min(8, Math.max(1, Number(profile.deviceMemory) || 8)),
     maxTouchPoints: Number(profile.maxTouchPoints) || 0,
     screen: {
       width: Number(profile.screen && profile.screen.width) || 1920,
@@ -132,8 +325,16 @@ function buildInjectionSource(profile, fullVersion) {
     textNoise: profile.textNoise !== false,
     rectNoise: profile.rectNoise === true,
     webrtc: profile.webrtc || 'proxy',
+    fakeIp: deriveFakeIp(profile.seed || 'seed'),
   };
-  const src = tpl.replace('__CFG__', JSON.stringify(cfg));
+}
+
+/** 读取并校验注入脚本，把 __CFG__ 替换成该环境的指纹参数 */
+function buildInjectionSource(profile) {
+  const tpl = fs.readFileSync(PATCH_FILE, 'utf8');
+  const cfg = buildConfig(profile);
+  // 用函数式替换：JSON 里若出现 $& / $1 之类，字符串替换会被当成替换模式
+  const src = tpl.replace('__CFG__', () => JSON.stringify(cfg));
   // 占位符必须被完全替换掉，否则注入脚本会抛 ReferenceError 并静默失效
   if (src.includes('__CFG__')) {
     throw new Error('注入脚本的配置占位符没有被替换（检查 fp/patch.js 里是否还有多余的占位符）');
@@ -177,11 +378,18 @@ function makeSessionPatcher(cdp, ctx) {
     await cdp.try_('Emulation.setUserAgentOverride', ctx.uaOverride, sessionId);
     await cdp.try_('Emulation.setTimezoneOverride', { timezoneId: ctx.timezone }, sessionId);
     await cdp.try_('Emulation.setLocaleOverride', { locale: ctx.locale }, sessionId);
-    await cdp.try_(
-      'Page.addScriptToEvaluateOnNewDocument',
-      { source: ctx.script, runImmediately: true },
-      sessionId
-    );
+    // 同一个 target 只挂一次注入脚本。
+    // 幂等放在 Node 侧（而不是在页面里留一个 symbol 标记）——页面里任何标记
+    // 都能被 Object.getOwnPropertySymbols(window) 一行枚举出来，等于自曝。
+    const tid = targetInfo && targetInfo.targetId;
+    if (tid && !ctx.scripted.has(tid)) {
+      const r = await cdp.try_(
+        'Page.addScriptToEvaluateOnNewDocument',
+        { source: ctx.script, runImmediately: true },
+        sessionId
+      );
+      if (r !== null) ctx.scripted.add(tid);
+    }
     if (type === 'page') {
       await cdp.try_('Emulation.setFocusEmulationEnabled', { enabled: true }, sessionId);
       // 页面里的跨域 iframe 是独立 target，也要挂上自动接管
@@ -192,6 +400,254 @@ function makeSessionPatcher(cdp, ctx) {
       );
     }
   };
+}
+
+/* ------------------------------ 实例注册表 ------------------------------ */
+/**
+ * data/instances.json 记录"哪个环境在哪个端口上跑着"。
+ * 控制台重启后，浏览器进程还在，但内存里的 running 没了 —— 有这个表就能重新接管，
+ * 而不是显示"已停止"、点启动还卡 25 秒超时。
+ */
+const REGISTRY_FILE = path.join(store.DATA, 'instances.json');
+
+function readRegistry() {
+  try {
+    const db = JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8'));
+    return db && typeof db === 'object' ? db : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeRegistry(db) {
+  try {
+    fs.mkdirSync(store.DATA, { recursive: true });
+    fs.writeFileSync(REGISTRY_FILE, JSON.stringify(db, null, 2), 'utf8');
+  } catch {
+    /* ignore */
+  }
+}
+
+function remember(inst) {
+  const db = readRegistry();
+  db[inst.profileId] = {
+    pid: inst.proc ? inst.proc.pid : null,
+    port: inst.port,
+    startedAt: inst.startedAt,
+    chromePath: inst.chromePath,
+    relayPort: inst.relay ? inst.relay.port : inst.relayPortHint || null,
+  };
+  writeRegistry(db);
+}
+
+function forget(profileId) {
+  const db = readRegistry();
+  if (!db[profileId]) return;
+  delete db[profileId];
+  writeRegistry(db);
+}
+
+function cleanupInstance(inst) {
+  running.delete(inst.profileId);
+  forget(inst.profileId);
+  if (inst.relay) {
+    try {
+      Promise.resolve(inst.relay.close()).catch(() => {});
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/* ------------------------------ 目标挂载工具 ------------------------------ */
+
+/** 统一挂上 autoAttach 的事件处理（launch 与 reattach 共用） */
+function wireTargetHandlers(cdp, instance, applySession) {
+  cdp.on('Target.attachedToTarget', async (params) => {
+    const { sessionId, targetInfo, waitingForDebugger } = params;
+    if (targetInfo && targetInfo.targetId) instance.sessions.set(targetInfo.targetId, sessionId);
+    try {
+      await applySession(sessionId, targetInfo);
+    } catch {
+      /* 单个 target 失败不影响整体 */
+    }
+    if (waitingForDebugger) {
+      try {
+        await cdp.send('Runtime.runIfWaitingForDebugger', {}, sessionId);
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+  cdp.on('Target.detachedFromTarget', ({ sessionId, targetId }) => {
+    for (const [tid, sid] of instance.sessions) {
+      if (sid === sessionId) {
+        instance.sessions.delete(tid);
+        instance.scripted.delete(tid);
+      }
+    }
+    if (targetId) instance.scripted.delete(targetId);
+  });
+}
+
+/** 接管已经存在的页面，返回主页面 session */
+async function attachExistingPages(cdp, instance, applySession) {
+  const { targetInfos } = await cdp.send('Target.getTargets');
+  const pages = targetInfos.filter((t) => t.type === 'page');
+  let mainSession = null;
+  for (const t of pages) {
+    try {
+      const r = await cdp.send('Target.attachToTarget', { targetId: t.targetId, flatten: true });
+      instance.sessions.set(t.targetId, r.sessionId);
+      await applySession(r.sessionId, t);
+      if (!mainSession) mainSession = r.sessionId;
+    } catch {
+      /* ignore */
+    }
+  }
+  return mainSession;
+}
+
+/* -------------------------- 控制台重启后的重接管 -------------------------- */
+
+/**
+ * 扫描注册表，把还活着的浏览器重新接回 CDP。
+ * 代理中继是随 Node 进程一起没的，所以尽量在原端口上重新拉起来（Chrome 的命令行还指着那个端口）。
+ */
+async function reattach() {
+  const db = readRegistry();
+  const ids = Object.keys(db);
+  if (!ids.length) return [];
+
+  const revived = [];
+  for (const id of ids) {
+    const meta = db[id] || {};
+    const profile = store.get(id);
+    if (!profile) {
+      forget(id);
+      continue;
+    }
+
+    // 端口只从 user-data-dir 里的 DevToolsActivePort 读，注册表里的可能已经过期
+    let wsUrl = '';
+    let port = 0;
+    try {
+      const lines = fs
+        .readFileSync(path.join(store.profileDir(id), 'DevToolsActivePort'), 'utf8')
+        .split('\n')
+        .map((s) => s.trim());
+      port = parseInt(lines[0], 10) || 0;
+      if (port > 0 && lines[1]) wsUrl = 'ws://127.0.0.1:' + port + lines[1];
+    } catch {
+      /* 没有就是没在跑 */
+    }
+    if (!wsUrl) {
+      forget(id);
+      continue;
+    }
+
+    let cdp = null;
+    try {
+      cdp = await CDP.connect(wsUrl, 3000);
+    } catch {
+      forget(id);
+      continue;
+    }
+
+    try {
+      const ver = await cdp.send('Browser.getVersion');
+      const product = (ver && ver.product) || '';
+      const fullVersion = (product.split('/')[1] || '').trim();
+
+      let relay = null;
+      const proxy = profile.proxy || {};
+      if (proxy.type !== 'none' && proxy.host && proxy.port) {
+        try {
+          relay = await createRelay(
+            {
+              type: proxy.type,
+              host: proxy.host,
+              port: proxy.port,
+              username: proxy.username,
+              password: proxy.password,
+            },
+            { port: meta.relayPort || 0 }
+          );
+        } catch {
+          relay = null; // 端口被占/上游不通：浏览器至少还能被接管、被关闭
+        }
+      }
+
+      const hints = await getRealHints(cdp, product);
+      const ua = buildUserAgent(profile, fullVersion, hints);
+      const cfg = buildConfig(profile);
+      const instance = {
+        profileId: id,
+        // 假 proc：只需要 pid 供 stop() 杀进程
+        proc: { pid: meta.pid || null, exitCode: null, on() {} },
+        relay,
+        startedAt: meta.startedAt || Date.now(),
+        logPath: path.join(store.DATA, 'logs', id + '.log'),
+        chromePath: meta.chromePath || '',
+        cdp,
+        port,
+        browserVersion: fullVersion,
+        sessions: new Map(),
+        scripted: new Set(),
+        ua,
+        reattached: true,
+      };
+
+      const ctx = {
+        uaOverride: {
+          userAgent: ua,
+          acceptLanguage: (profile.languages || ['zh-CN']).join(','),
+          platform: (PLATFORM_UA[profile.platform] || PLATFORM_UA.win).nav,
+          userAgentMetadata: buildUaMetadata(profile, fullVersion, hints),
+        },
+        timezone: profile.timezone || 'Asia/Shanghai',
+        locale: profile.locale || 'zh-CN',
+        script: buildInjectionSource(profile),
+        scripted: instance.scripted,
+      };
+      const applySession = makeSessionPatcher(cdp, ctx);
+
+      instance.__script = ctx.script;
+      instance.__uaOverride = ctx.uaOverride;
+      instance.__tz = ctx.timezone;
+      instance.__locale = ctx.locale;
+      instance.__expect = {
+        hardwareConcurrency: cfg.hardwareConcurrency,
+        deviceMemory: cfg.deviceMemory,
+        screenWidth: cfg.screen.width,
+        pixelRatio: cfg.screen.pixelRatio,
+      };
+
+      cdp.on('close', () => cleanupInstance(instance));
+      wireTargetHandlers(cdp, instance, applySession);
+      await cdp.try_('Target.setAutoAttach', {
+        autoAttach: true,
+        waitForDebuggerOnStart: true,
+        flatten: true,
+      });
+      instance.mainSession = await attachExistingPages(cdp, instance, applySession);
+
+      running.set(id, instance);
+      // relay 没抢回端口时保留原记录，下次重启还可以再试
+      if (!instance.relay && meta.relayPort) instance.relayPortHint = meta.relayPort;
+      remember(instance);
+      revived.push(publicInfo(instance));
+    } catch (e) {
+      try {
+        cdp.close();
+      } catch {
+        /* ignore */
+      }
+      console.warn('[launch] 接管环境 ' + id + ' 失败，已从注册表移除：' + (e && e.message ? e.message : e));
+      forget(id);
+    }
+  }
+  return revived;
 }
 
 /* ---------------------------------- 启动 ---------------------------------- */
@@ -255,6 +711,7 @@ async function launch(profileId, options = {}) {
     '--disable-session-crashed-bubble',
     '--hide-crash-restore-bubble',
     '--window-size=' + Math.round(screenW * 0.86) + ',' + Math.round(screenH * 0.86),
+    '--window-position=0,0',
     '--lang=' + (profile.languages && profile.languages[0] ? profile.languages[0] : 'zh-CN'),
   ];
   if (relay) {
@@ -268,6 +725,9 @@ async function launch(profileId, options = {}) {
   const logFd = fs.openSync(logPath, 'a');
   const proc = spawn(chromePath, args, {
     stdio: ['ignore', 'ignore', logFd],
+    // detached：浏览器不跟控制台绑在一起（控制台崩了它还能活着，下次启动时接管回来），
+    // 在 POSIX 上还顺带让它成为进程组头，stop() 才能整组杀掉
+    detached: true,
     windowsHide: false,
   });
   proc.on('error', (e) => {
@@ -289,13 +749,12 @@ async function launch(profileId, options = {}) {
     port: 0,
     browserVersion: '',
     sessions: new Map(),
+    scripted: new Set(), // 已经挂过注入脚本的 targetId（Node 侧幂等，页面里不留标记）
+    ua: '',
   };
   running.set(profileId, instance);
 
-  const cleanup = async () => {
-    running.delete(profileId);
-    if (relay) await relay.close();
-  };
+  const cleanup = () => cleanupInstance(instance);
 
   try {
     /* 4. 连上 DevTools */
@@ -303,33 +762,36 @@ async function launch(profileId, options = {}) {
     instance.port = port;
     const cdp = await CDP.connect(wsUrl);
     instance.cdp = cdp;
+    // 先登记再接管：万一后面某步抛错，stop() 能把登记一起清掉
+    remember(instance);
 
-    cdp.on('close', () => {
-      cleanup();
-    });
-    proc.on('exit', () => {
-      cleanup();
-    });
+    cdp.on('close', () => cleanup());
+    proc.on('exit', () => cleanup());
 
-    /* 5. 拿真实 Chrome 版本，拼 UA —— 保证 UA 版本与内核一致，不做"假版本" */
+    /* 5. 拿真实 Chrome 版本 + 浏览器自己报的 UA-CH，拼 UA —— 版本/品牌都跟内核一致，不做"假版本" */
     const ver = await cdp.send('Browser.getVersion');
     const product = ver.product || '';
     const fullVersion = (product.split('/')[1] || '141.0.0.0').trim();
     instance.browserVersion = fullVersion;
 
-    const ua = buildUserAgent(profile, fullVersion);
+    // 必须在任何 setUserAgentOverride 之前读，否则读到的是我们自己伪造的值
+    const hints = await getRealHints(cdp, product);
+
+    const ua = buildUserAgent(profile, fullVersion, hints);
     const uaOverride = {
       userAgent: ua,
       acceptLanguage: (profile.languages || ['zh-CN']).join(','),
       platform: (PLATFORM_UA[profile.platform] || PLATFORM_UA.win).nav,
-      userAgentMetadata: buildUaMetadata(profile, fullVersion),
+      userAgentMetadata: buildUaMetadata(profile, fullVersion, hints),
     };
 
+    const cfg = buildConfig(profile);
     const ctx = {
       uaOverride,
       timezone: profile.timezone || 'Asia/Shanghai',
       locale: profile.locale || 'zh-CN',
-      script: buildInjectionSource(profile, fullVersion),
+      script: buildInjectionSource(profile),
+      scripted: instance.scripted,
     };
     instance.ua = ua;
     // 供 probe() 在临时标签页里复用同一套覆写
@@ -337,51 +799,25 @@ async function launch(profileId, options = {}) {
     instance.__uaOverride = uaOverride;
     instance.__tz = ctx.timezone;
     instance.__locale = ctx.locale;
+    // probe 用这几个值交叉验证"补丁到底生没生效"（页面里不再留 symbol 标记）
+    instance.__expect = {
+      hardwareConcurrency: cfg.hardwareConcurrency,
+      deviceMemory: cfg.deviceMemory,
+      screenWidth: cfg.screen.width,
+      pixelRatio: cfg.screen.pixelRatio,
+    };
 
     /* 6. 接管已有页面 */
     const applySession = makeSessionPatcher(cdp, ctx);
-    const { targetInfos } = await cdp.send('Target.getTargets');
-    const pages = targetInfos.filter((t) => t.type === 'page');
 
     // 先挂自动接管，再逐个处理已存在的页面，避免漏掉加载中的 iframe
-    cdp.on('Target.attachedToTarget', async (params) => {
-      const { sessionId, targetInfo, waitingForDebugger } = params;
-      if (targetInfo && targetInfo.targetId) instance.sessions.set(targetInfo.targetId, sessionId);
-      try {
-        await applySession(sessionId, targetInfo);
-      } catch (e) {
-        /* 单个 target 失败不影响整体 */
-      }
-      if (waitingForDebugger) {
-        try {
-          await cdp.send('Runtime.runIfWaitingForDebugger', {}, sessionId);
-        } catch {
-          /* ignore */
-        }
-      }
-    });
-    cdp.on('Target.detachedFromTarget', ({ sessionId }) => {
-      for (const [tid, sid] of instance.sessions) {
-        if (sid === sessionId) instance.sessions.delete(tid);
-      }
-    });
+    wireTargetHandlers(cdp, instance, applySession);
     await cdp.try_('Target.setAutoAttach', {
       autoAttach: true,
       waitForDebuggerOnStart: true,
       flatten: true,
     });
-
-    let mainSession = null;
-    for (const t of pages) {
-      try {
-        const r = await cdp.send('Target.attachToTarget', { targetId: t.targetId, flatten: true });
-        instance.sessions.set(t.targetId, r.sessionId);
-        await applySession(r.sessionId, t);
-        if (!mainSession) mainSession = r.sessionId;
-      } catch {
-        /* ignore */
-      }
-    }
+    const mainSession = await attachExistingPages(cdp, instance, applySession);
     instance.mainSession = mainSession;
 
     /* 7. 打开起始页（此时补丁与覆写已就位） */
@@ -433,8 +869,13 @@ function killTree(pid) {
 
 async function stop(profileId) {
   const inst = running.get(profileId);
-  if (!inst) return false;
+  if (!inst) {
+    // 不在内存里，但注册表里可能有（比如刚重启还没 reattach），顺手清掉
+    forget(profileId);
+    return false;
+  }
   running.delete(profileId);
+  forget(profileId);
   try {
     if (inst.cdp) inst.cdp.close();
   } catch {
@@ -484,9 +925,14 @@ function listRunning() {
 /* ------------------------------ 指纹实时检测 ------------------------------ */
 
 const PROBE_EXPR = `(async () => {
+  const EXPECT = __EXPECT__;
   const out = {};
-  // 注入脚本是否真的生效（Symbol 不会出现在 getOwnPropertyNames 里，很难被站点枚举）
-  out.injected = Object.getOwnPropertySymbols(window).some(s => String(s).indexOf('Symbol(fb.') === 0);
+  // 注入脚本是否真的生效：拿几个只能由补丁产生的值交叉验证。
+  // 以前这里是查 window 上的 Symbol(fb.<seed>)，那等于把检测方法教给站点。
+  out.injected = navigator.hardwareConcurrency === EXPECT.hardwareConcurrency &&
+    navigator.deviceMemory === EXPECT.deviceMemory &&
+    screen.width === EXPECT.screenWidth &&
+    window.devicePixelRatio === EXPECT.pixelRatio;
   out.secureContext = window.isSecureContext;
   out.userAgent = navigator.userAgent;
   out.platform = navigator.platform;
@@ -592,11 +1038,18 @@ async function evaluateInProbePage(profileId, expression) {
     await cdp.try_('Emulation.setUserAgentOverride', inst.__uaOverride || {}, sessionId);
     await cdp.try_('Emulation.setTimezoneOverride', { timezoneId: inst.__tz || 'Asia/Shanghai' }, sessionId);
     await cdp.try_('Emulation.setLocaleOverride', { locale: inst.__locale || 'zh-CN' }, sessionId);
-    await cdp.try_(
-      'Page.addScriptToEvaluateOnNewDocument',
-      { source: inst.__script || '' },
-      sessionId
-    );
+
+    // 注入脚本由 autoAttach 统一挂；这里只等它挂好（重复注入会让补丁叠加，指纹就变了）
+    const t2 = Date.now();
+    while (!inst.scripted.has(targetId) && Date.now() - t2 < 2000) await sleep(30);
+    if (!inst.scripted.has(targetId)) {
+      const r = await cdp.try_(
+        'Page.addScriptToEvaluateOnNewDocument',
+        { source: inst.__script || '', runImmediately: true },
+        sessionId
+      );
+      if (r !== null) inst.scripted.add(targetId);
+    }
 
     // 导航到 localhost（安全上下文），并等真正的 load 事件
     let loaded = false;
@@ -629,7 +1082,10 @@ async function evaluateInProbePage(profileId, expression) {
 
 /** 指纹检测：返回结构化的指纹报告 */
 async function probe(profileId) {
-  const raw = await evaluateInProbePage(profileId, PROBE_EXPR);
+  const inst = running.get(profileId);
+  if (!inst) throw new Error('环境未运行');
+  const expect = inst.__expect || {};
+  const raw = await evaluateInProbePage(profileId, PROBE_EXPR.replace('__EXPECT__', () => JSON.stringify(expect)));
   return JSON.parse(raw);
 }
 
@@ -637,11 +1093,14 @@ module.exports = {
   launch,
   stop,
   stopAll,
+  reattach,
   probe,
   evaluateInProbePage,
   getRunning,
   listRunning,
   buildInjectionSource,
+  buildConfig,
   buildUserAgent,
+  buildUaMetadata,
   PLATFORM_UA,
 };

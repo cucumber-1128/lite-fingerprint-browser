@@ -10,13 +10,9 @@
   'use strict';
 
   var CFG = __CFG__;
-  var GUARD = Symbol.for('fb.' + CFG.seed);
-  try {
-    if (window[GUARD]) return;
-    Object.defineProperty(window, GUARD, { value: true, enumerable: false, configurable: false });
-  } catch (e) {
-    return;
-  }
+  // 幂等由 Node 侧保证（同一个 target 只挂一次脚本），页面里不留任何标记：
+  // 任何 `window[Symbol.for('fb.'+seed)]` 这种守卫都能被
+  // Object.getOwnPropertySymbols(window) 一行枚举出来，等于主动告诉站点"我被改过"。
 
   /* --------------------------- 让补丁看起来是原生的 --------------------------- */
 
@@ -87,9 +83,11 @@
       colorDepth: S.colorDepth || 24,
       pixelDepth: S.colorDepth || 24,
     });
+    // outerWidth / outerHeight 不要改：窗口是按 --window-size 开的真实尺寸，
+    // 把它们钉成整屏尺寸会出现 "outer - inner = 237px" 这种真窗口不可能有的差，
+    // 反而是一眼假的信号。devicePixelRatio 必须跟着屏幕走，且它在 Chrome 里
+    // 本来就是 window 的自有属性，覆盖到实例上不露馅。
     defineGetters(window, {
-      outerWidth: S.width,
-      outerHeight: S.height,
       devicePixelRatio: S.pixelRatio || 1,
     });
   }
@@ -369,23 +367,49 @@
   if (CFG.audioNoise && typeof AudioBuffer !== 'undefined') {
     var AUD_SEED = hash32(CFG.seed + ':audio');
     var touched = new WeakSet();
+
+    // 噪声按"采样序号"算，不是按读取顺序算 —— 这样 getChannelData 和
+    // copyFromChannel 拿到的偏移完全一致，不会出现"换个 API 就读到干净数据"。
+    function noiseAt(i) {
+      var h = (AUD_SEED ^ Math.imul(i + 1, 2654435761)) >>> 0;
+      h = Math.imul(h ^ (h >>> 15), 2246822519) >>> 0;
+      return h & 1 ? 1e-7 : -1e-7;
+    }
+    function perturb(d, start) {
+      var s = start || 0;
+      var first = (97 - (s % 97)) % 97;
+      for (var i = first; i < d.length; i += 97) {
+        d[i] = d[i] + noiseAt(s + i);
+      }
+    }
+
     var origGetChannelData = AudioBuffer.prototype.getChannelData;
     AudioBuffer.prototype.getChannelData = mask(function getChannelData() {
       var d = origGetChannelData.apply(this, arguments);
       try {
         if (!touched.has(this)) {
           touched.add(this);
-          var h = AUD_SEED;
-          for (var i = 0; i < d.length; i += 97) {
-            h = (Math.imul(h, 1664525) + 1013904223) >>> 0;
-            d[i] = d[i] + (h & 1 ? 1e-7 : -1e-7);
-          }
+          perturb(d, 0);
         }
       } catch (e) {
         /* ignore */
       }
       return d;
     }, 'getChannelData');
+
+    var origCopyFromChannel = AudioBuffer.prototype.copyFromChannel;
+    if (origCopyFromChannel) {
+      AudioBuffer.prototype.copyFromChannel = mask(function copyFromChannel(dest, channel, start) {
+        origCopyFromChannel.apply(this, arguments);
+        try {
+          // 内部数据还没被 getChannelData 改过时，这里补上同一套偏移；
+          // 已经改过就直接用（避免同一个 buffer 被加两次噪声）
+          if (!touched.has(this) && dest && dest.length) perturb(dest, Number(start) || 0);
+        } catch (e) {
+          /* ignore */
+        }
+      }, 'copyFromChannel');
+    }
 
     if (typeof AnalyserNode !== 'undefined') {
       var origFloat = AnalyserNode.prototype.getFloatFrequencyData;
@@ -411,6 +435,8 @@
     var DISABLED = CFG.webrtc === 'disabled';
     var IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
 
+    // 只改 a=candidate 行。SDP 里 o= / c= 那两行真 Chrome 自己写的就是 127.0.0.1 / 0.0.0.0，
+    // 一起替换反而制造出一个真机不会出现的本地地址。
     function cleanSdp(sdp) {
       if (!sdp || sdp.indexOf('candidate') < 0) return sdp;
       var out = sdp;
@@ -423,29 +449,52 @@
           .join('\r\n');
       }
       try {
-        out = out.replace(IPV4, FAKE_IP);
+        out = out.replace(/a=candidate:[^\r\n]*/g, function (line) {
+          return line.replace(IPV4, FAKE_IP);
+        });
       } catch (e) {
         /* ignore */
       }
       return out;
     }
 
-    function patchDescCtor(name) {
+    function cleanCandidate(cand) {
+      try {
+        return String(cand == null ? '' : cand).replace(IPV4, FAKE_IP);
+      } catch (e) {
+        return cand;
+      }
+    }
+
+    function patchRtcCtor(name, prop, clean) {
       var Ctor = window[name];
       if (!Ctor || !Ctor.prototype) return;
-      var d = Object.getOwnPropertyDescriptor(Ctor.prototype, 'sdp') || Object.getOwnPropertyDescriptor(Ctor.prototype, 'candidate');
-      var prop = d ? (Object.getOwnPropertyDescriptor(Ctor.prototype, 'sdp') ? 'sdp' : 'candidate') : null;
-      if (!prop || !d || !d.get) return;
-      Object.defineProperty(Ctor.prototype, prop, {
-        configurable: true,
-        enumerable: true,
-        get: mask(function () {
-          return cleanSdp(d.get.call(this));
-        }, 'get ' + prop),
-      });
+      var d = Object.getOwnPropertyDescriptor(Ctor.prototype, prop);
+      if (d && d.get) {
+        Object.defineProperty(Ctor.prototype, prop, {
+          configurable: true,
+          enumerable: true,
+          get: mask(function () {
+            return clean(d.get.call(this));
+          }, 'get ' + prop),
+        });
+      }
+      // toJSON 读的是内部槽，不经过上面的 getter —— 不补就是一个现成的绕过口
+      var origJSON = Ctor.prototype.toJSON;
+      if (typeof origJSON === 'function') {
+        Ctor.prototype.toJSON = mask(function toJSON() {
+          var o = origJSON.apply(this, arguments);
+          if (o && typeof o === 'object' && typeof o[prop] === 'string') {
+            var copy = Object.assign({}, o);
+            copy[prop] = clean(o[prop]);
+            return copy;
+          }
+          return o;
+        }, 'toJSON');
+      }
     }
-    patchDescCtor('RTCSessionDescription');
-    patchDescCtor('RTCIceCandidate');
+    patchRtcCtor('RTCSessionDescription', 'sdp', cleanSdp);
+    patchRtcCtor('RTCIceCandidate', 'candidate', cleanCandidate);
 
     var RTCOrig = window.RTCPeerConnection || window.webkitRTCPeerConnection;
     if (RTCOrig) {

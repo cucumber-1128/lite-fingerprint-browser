@@ -176,7 +176,7 @@ function httpProxyConnect(upstream, targetHost, targetPort) {
  * @param {{type:'http'|'socks5', host:string, port:number, username?:string, password?:string}} upstream
  * @returns {Promise<{port:number, close:()=>Promise<void>}>}
  */
-async function createRelay(upstream) {
+async function createRelay(upstream, opts = {}) {
   const up = {
     host: String(upstream.host || '').trim(),
     port: Number(upstream.port),
@@ -193,6 +193,63 @@ async function createRelay(upstream) {
   };
 
   const server = http.createServer();
+
+  /** 转发 Upgrade 请求头（明文 ws:// 走这里；wss:// 走 CONNECT） */
+  function upgradeHead(req, url, absolute) {
+    const lines = [req.method + ' ' + (absolute ? req.url : url.pathname + url.search) + ' HTTP/1.1'];
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (k === 'proxy-authorization' || k === 'proxy-connection') continue;
+      lines.push(k + ': ' + (Array.isArray(v) ? v.join(', ') : v));
+    }
+    if (absolute && up.username) {
+      lines.push('proxy-authorization: ' + basicAuth(up.username, up.password));
+    }
+    return lines.join('\r\n') + '\r\n\r\n';
+  }
+
+  server.on('upgrade', (req, clientSocket, head) => {
+    let url;
+    try {
+      url = new URL(req.url);
+    } catch {
+      clientSocket.destroy();
+      return;
+    }
+    const port = Number(url.port) || (url.protocol === 'wss:' ? 443 : 80);
+    clientSocket.on('error', () => {});
+
+    const pipe = (sock, absolute) => {
+      sock.write(upgradeHead(req, url, absolute));
+      if (head && head.length) sock.write(head);
+      sock.pipe(clientSocket);
+      clientSocket.pipe(sock);
+      sock.on('error', () => clientSocket.destroy());
+      clientSocket.on('error', () => sock.destroy());
+    };
+
+    if (upstream.type === 'socks5') {
+      socks5Connect({ ...up, targetHost: url.hostname, targetPort: port })
+        .then((sock) => pipe(sock, false))
+        .catch((e) => {
+          try {
+            clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+          } catch {
+            /* ignore */
+          }
+          server.emit('relay-error', e);
+        });
+    } else {
+      const sock = net.connect(up.port, up.host, () => pipe(sock, true));
+      sock.on('error', (e) => {
+        try {
+          clientSocket.destroy();
+        } catch {
+          /* ignore */
+        }
+        server.emit('relay-error', e);
+      });
+    }
+  });
 
   server.on('connect', async (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
@@ -290,7 +347,8 @@ async function createRelay(upstream) {
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
+    // 重接管时要抢回原来那个端口（Chrome 的命令行还指着它）
+    server.listen(opts.port || 0, '127.0.0.1', resolve);
   });
 
   return {

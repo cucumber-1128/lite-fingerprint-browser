@@ -10,7 +10,13 @@
  */
 const net = require('node:net');
 const crypto = require('node:crypto');
+const os = require('node:os');
+const path = require('node:path');
 const { execFile } = require('node:child_process');
+
+// 一次性探测脚本也不碰生产数据
+process.env.FB_DATA = process.env.FB_DATA || path.join(os.tmpdir(), 'fb-tls-' + process.pid);
+
 const launcher = require('../src/launch');
 const store = require('../src/store');
 

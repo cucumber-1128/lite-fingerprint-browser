@@ -5,6 +5,12 @@
  *   node test/_device-probe.js
  */
 const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
+
+// 一次性探测脚本也不碰生产数据
+process.env.FB_DATA = process.env.FB_DATA || path.join(os.tmpdir(), 'fb-audit-' + process.pid);
+
 const store = require('../src/store');
 const launcher = require('../src/launch');
 

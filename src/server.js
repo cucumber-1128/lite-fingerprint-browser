@@ -77,16 +77,50 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+/** 密码只写不读：接口只回 hasPassword，前端留空表示"不修改已保存的密码" */
+function publicProfile(profile) {
+  const p = { ...profile };
+  if (p.proxy && typeof p.proxy === 'object') {
+    const { password, ...rest } = p.proxy;
+    p.proxy = { ...rest, hasPassword: !!password };
+  }
+  return p;
+}
+
 function withRunning(profile) {
   const info = launcher.getRunning(profile.id);
-  return { ...profile, running: !!info, instance: info };
+  return { ...publicProfile(profile), running: !!info, instance: info };
 }
 
 function createServer() {
   const server = http.createServer(async (req, res) => {
+    const method = req.method || 'GET';
+    const boundPort = server.address() ? server.address().port : 0;
+    const host = String(req.headers.host || '').toLowerCase();
+    const localHosts = ['127.0.0.1:' + boundPort, 'localhost:' + boundPort, '[::1]:' + boundPort];
+
+    // 只认本机 Host：挡住 DNS rebinding——恶意域名解析到 127.0.0.1 后，
+    // 页面就成了"同源"，能直接读走 /api/state（里面有代理配置）
+    if (!localHosts.includes(host)) {
+      return json(res, 403, { error: '只允许通过 127.0.0.1 访问控制台' });
+    }
+
+    // 写操作校验 Origin：挡住跨站表单 / fetch / sendBeacon（CSRF）
+    if (method !== 'GET' && method !== 'HEAD') {
+      const origin = req.headers.origin;
+      if (origin) {
+        let sameHost = false;
+        try {
+          sameHost = new URL(origin).host.toLowerCase() === host;
+        } catch {
+          sameHost = false;
+        }
+        if (!sameHost) return json(res, 403, { error: '跨站请求被拒绝' });
+      }
+    }
+
     const url = new URL(req.url, 'http://127.0.0.1');
     const pathname = decodeURIComponent(url.pathname);
-    const method = req.method || 'GET';
 
     try {
       /* ------------------------------- API ------------------------------- */

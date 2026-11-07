@@ -2,7 +2,7 @@
 
 一个**零依赖**的指纹浏览器（防关联浏览器）：每个"环境"有自己独立的 Cookie 存储、独立的指纹、独立的代理 IP。
 
-不打包 Electron、不内嵌 Chromium —— 直接复用你机器上已有的 Chrome / Edge，整个项目只有 **约 3400 行代码（含测试）、零 npm 依赖**，目录 218 KB。
+不打包 Electron、不内嵌 Chromium —— 直接复用你机器上已有的 Chrome / Edge，整个项目只有 **约 4200 行代码（含测试）、零 npm 依赖**，目录 240 KB。
 
 ![控制台](docs/screenshot.png)
 
@@ -69,7 +69,7 @@ npm test                            # 跑冒烟测试（会真的启动两个浏
 | 项 | 手段 |
 |---|---|
 | `hardwareConcurrency` / `deviceMemory` / `maxTouchPoints` | `Navigator.prototype` getter 重定义 |
-| `screen.*` / `outerWidth` / `devicePixelRatio` | `Screen.prototype` getter 重定义 |
+| `screen.*` / `devicePixelRatio` | `Screen.prototype` / `window` getter 重定义；`outerWidth`/`outerHeight` **不伪造**（窗口本来就是按屏幕比例开的真实尺寸，钉成整屏反而会出现真窗口不可能有的 `outer - inner` 差值） |
 | **Canvas** 指纹 | 24 个像素的定点 LSB 扰动，按环境 seed 确定性生成（同一环境每次一样，不同环境不一样） |
 | **WebGL** 厂商/渲染器 | `getParameter` 覆写 37445/37446 及 VENDOR/RENDERER |
 | **Audio** 指纹 | `AudioBuffer.getChannelData` 加 1e-7 级噪声、`AnalyserNode` 加噪 |
@@ -79,6 +79,8 @@ npm test                            # 跑冒烟测试（会真的启动两个浏
 | 元素坐标（可选，默认关） | `getBoundingClientRect` 亚像素偏移 |
 
 所有补丁函数都会重写 `Function.prototype.toString`，让它们看起来是 `[native code]`。
+
+幂等性放在 **Node 侧**（同一个 target 只注入一次脚本），页面里**不留任何标记**。这一点很关键：以前那种 `window[Symbol.for('fb.'+seed)]` 的守卫，`Object.getOwnPropertySymbols(window)` 一行就能枚举出来，等于主动告诉站点"这个浏览器被改过"。
 
 **环境隔离**：每个环境一个独立 `--user-data-dir`（`data/profiles/<id>/`），Cookie、localStorage、IndexedDB、缓存、登录态完全隔开，互不可见。
 
@@ -162,9 +164,15 @@ MAC 地址、主板/硬盘序列号、CPU ID、Windows `MachineGuid`、SMBIOS UU
 
 ### 而这恰好是本项目的优势
 
-我们**复用真 Chrome**，TLS 指纹天然就是真 Chrome 的，而且和 UA 声明的版本**永远一致**（因为我们不伪造版本号，用真实版本号）。反而是自带改过内核的商业方案，一旦内核版本和声称的 UA 对不上，就会出现"TLS 是 Chrome 141、UA 说自己是 157"这种硬伤。
+我们**复用真 Chrome**，TLS 指纹天然就是真 Chrome 的，而且和 UA 声明的版本**永远一致**。反而是自带改过内核的商业方案，一旦内核版本和声称的 UA 对不上，就会出现"TLS 是 Chrome 141、UA 说自己是 157"这种硬伤。
 
-所以代码里刻意**不伪造 Chrome 版本号**：伪造版本的收益是假的，代价是真不一致。
+### UA 这一步比想象的细：版本号必须"看起来不完整"
+
+真 Chrome 从 110 起做了 **UA reduction**：请求头里只有 `Chrome/156.0.0.0`，完整版本号 `156.0.8078.80` 只出现在 UA-CH（`uaFullVersion`）里。所以"用完整版本号拼 UA"看着更精确，实际是**一眼就能筛出来的特征**——真机不会那么发。
+
+同理，`sec-ch-ua` 里那个 GREASE 品牌名、版本、以及**顺序**（Chrome 156 是 `"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"`）每个版本都在变，手拼必然过时。所以本项目**不自己拼**：启动时开一个后台标签页请求本地探针，把浏览器自己发的请求头和 `getHighEntropyValues()` 读回来，缓存到 `data/client-hints.json`，之后只替换平台相关字段（`platform` / `platformVersion` / 架构）。这样在 Windows 上跑 Windows 指纹时，服务端看到的 UA、`sec-ch-ua`、`accept-language` 与真机**逐字节一致**；换成 macOS 指纹时只换平台段。
+
+代价是每个 Chrome 版本第一次启动会多一个一闪而过的后台标签页。
 
 ## 关于代理（这是能做多账号的关键）
 
@@ -217,7 +225,8 @@ fingerprint-browser/
 │   └── fp/patch.js     主世界指纹补丁（被当纯文本注入，用 __CFG__ 占位）
 ├── public/             控制台前端（原生 JS，无构建）
 ├── test/smoke.js       冒烟测试：静态自检 + 代理 + 真实启动读指纹
-└── data/               运行时生成：profiles.json、各环境 user-data-dir、日志
+└── data/               运行时生成：profiles.json、instances.json、client-hints.json、
+                        各环境 user-data-dir、日志（路径可用 FB_DATA 覆盖）
 ```
 
 ## 常用操作
@@ -226,6 +235,9 @@ fingerprint-browser/
 - **多开**：直接再点另一个环境的「启动」，互相独立。
 - **排查启动失败**：看 `data/logs/<环境id>.log`（Chrome 自己的 stderr）。
 - **重置某个环境**：删掉后重建（等于换了新机器）。
+- **控制台崩了/重启了**：浏览器进程是独立起来的（`detached`），控制台下次启动会按 `data/instances.json` + `DevToolsActivePort` 自动**接管**回来，卡片直接显示「运行中」，代理中继也会在原端口上重新拉起来。不用手动去任务管理器里杀残留。
+- **换数据目录**：`FB_DATA=D:\fb-data node src/index.js`，测试脚本默认就写临时目录，不会碰你的环境。
+- **数据损坏**：`profiles.json` 解析失败时会先备份成 `profiles.json.corrupt-<时间戳>` 再放空库，不会把你所有环境覆盖掉。
 
 ## 合规
 

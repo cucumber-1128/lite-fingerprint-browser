@@ -90,10 +90,18 @@ function render() {
     .join('');
 }
 
-async function load() {
+let renderedJson = '';
+
+async function load(force) {
   try {
-    state = await api('/api/state');
-    render();
+    const next = await api('/api/state');
+    state = next;
+    const json = JSON.stringify(next);
+    // 数据没变就不重绘：以前每 6s 把整张卡片列表 innerHTML 重建一遍
+    if (force || json !== renderedJson) {
+      renderedJson = json;
+      render();
+    }
   } catch (e) {
     toast('读取状态失败：' + e.message, true);
   }
@@ -119,6 +127,11 @@ function openEditor(profile) {
   editingId = profile ? profile.id : null;
   $('#editorTitle').textContent = profile ? '编辑环境' : '新建环境';
   $('#editorErr').textContent = '';
+
+  // 密码是"只写不读"：接口不回密码，这里始终留空
+  const pwInput = $('#editorForm').querySelector('[name="proxyPassword"]');
+  pwInput.value = '';
+  pwInput.placeholder = '';
 
   if (profile) {
     const s = profile.screen || {};
@@ -150,7 +163,7 @@ function openEditor(profile) {
     setVal('proxyHost', px.host);
     setVal('proxyPort', px.port);
     setVal('proxyUsername', px.username);
-    setVal('proxyPassword', px.password);
+    pwInput.placeholder = px.hasPassword ? '已保存，留空表示不修改' : '';
   } else {
     setVal('name', '');
     setVal('startUrl', 'about:blank');
@@ -194,6 +207,16 @@ function readEditor() {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+  const proxy = {
+    type: getVal('proxyType'),
+    host: getVal('proxyHost').trim(),
+    port: getVal('proxyPort').trim(),
+    username: getVal('proxyUsername').trim(),
+  };
+  // 留空 = 不修改已保存的密码（新建环境时留空就是没密码）
+  const pw = getVal('proxyPassword');
+  if (pw) proxy.password = pw;
+
   return {
     name: getVal('name').trim(),
     startUrl: getVal('startUrl').trim() || 'about:blank',
@@ -220,13 +243,7 @@ function readEditor() {
     audioNoise: getVal('audioNoise'),
     textNoise: getVal('textNoise'),
     rectNoise: getVal('rectNoise'),
-    proxy: {
-      type: getVal('proxyType'),
-      host: getVal('proxyHost').trim(),
-      port: getVal('proxyPort').trim(),
-      username: getVal('proxyUsername').trim(),
-      password: getVal('proxyPassword'),
-    },
+    proxy,
   };
 }
 
@@ -359,7 +376,7 @@ document.addEventListener('click', (e) => {
 });
 
 $('#btnNew').addEventListener('click', () => openEditor(null));
-$('#btnRefresh').addEventListener('click', load);
+$('#btnRefresh').addEventListener('click', () => load(true));
 $('#btnCancel').addEventListener('click', () => $('#editor').close());
 $('#btnSave').addEventListener('click', saveEditor);
 $('#btnCloseReport').addEventListener('click', () => $('#report').close());
@@ -394,8 +411,9 @@ $('#btnRandom').addEventListener('click', async () => {
   for (const arr of Object.values(state.timezones || {})) for (const tz of arr) all.add(tz);
   $('#tzList').innerHTML = [...all].map((t) => '<option value="' + esc(t) + '">').join('');
 
-  // 轮询同步运行状态
+  // 轮询同步运行状态（页面在后台就停掉，别白跑）
   setInterval(() => {
+    if (document.hidden) return;
     if (document.querySelector('dialog[open]')) return;
     load();
   }, 6000);

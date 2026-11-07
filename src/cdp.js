@@ -53,7 +53,10 @@ class CDP extends EventEmitter {
       ws.addEventListener('message', (ev) => this._onMessage(ev.data));
       ws.addEventListener('close', () => {
         this._closed = true;
-        for (const p of this._pending.values()) p.reject(new Error('CDP 连接已关闭'));
+        for (const p of this._pending.values()) {
+          clearTimeout(p.timer);
+          p.reject(new Error('CDP 连接已关闭'));
+        }
         this._pending.clear();
         this.emit('close');
       });
@@ -71,6 +74,7 @@ class CDP extends EventEmitter {
       const p = this._pending.get(msg.id);
       if (!p) return;
       this._pending.delete(msg.id);
+      clearTimeout(p.timer);
       if (msg.error) p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
       else p.resolve(msg.result);
       return;
@@ -94,13 +98,15 @@ class CDP extends EventEmitter {
       return Promise.reject(e);
     }
     return new Promise((resolve, reject) => {
-      this._pending.set(id, { resolve, reject });
-      setTimeout(() => {
+      // 定时器必须清掉：每条指令漏一个 15s 的 timer，长跑的控制台会一直堆积
+      const timer = setTimeout(() => {
         if (this._pending.has(id)) {
           this._pending.delete(id);
           reject(new Error('CDP 指令超时：' + method));
         }
       }, 15000);
+      if (typeof timer.unref === 'function') timer.unref();
+      this._pending.set(id, { resolve, reject, timer });
     });
   }
 
