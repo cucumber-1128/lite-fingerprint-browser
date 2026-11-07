@@ -14,6 +14,11 @@
     <span class="ver" id="browserVer">读取内核中…</span>
   </div>
   <div class="actions">
+    <input id="search" class="search" type="search" placeholder="搜索名称 / 分组 / 代理…" />
+    <select id="groupFilter" class="group-filter"><option value="">全部分组</option></select>
+    <button class="btn ghost" id="btnExport">导出</button>
+    <button class="btn ghost" id="btnImport">导入</button>
+    <input type="file" id="importFile" accept="application/json,.json" hidden />
     <button class="btn ghost" id="btnRefresh">刷新</button>
     <button class="btn primary" id="btnNew">+ 新建环境</button>
   </div>
@@ -37,10 +42,13 @@
       <label>名称
         <input name="name" placeholder="例如 店铺A-美国" required />
       </label>
-      <label>起始页
-        <input name="startUrl" placeholder="about:blank" />
+      <label>分组
+        <input name="group" placeholder="例如 美国-店铺" />
       </label>
     </div>
+    <label class="full">起始页
+      <input name="startUrl" placeholder="about:blank" />
+    </label>
 
     <h3>指纹
       <button type="button" class="btn tiny" id="btnRandom">随机一套</button>
@@ -112,6 +120,7 @@
       <label><input type="checkbox" name="canvasNoise" /> Canvas 噪声</label>
       <label><input type="checkbox" name="audioNoise" /> Audio 噪声</label>
       <label><input type="checkbox" name="textNoise" /> 字体测量噪声</label>
+      <label><input type="checkbox" name="fontNoise" /> 字体列表伪装（按声明平台过滤）</label>
       <label><input type="checkbox" name="rectNoise" /> 元素坐标噪声（进阶，可能影响布局判断）</label>
     </div>
 
@@ -148,6 +157,15 @@
   <div id="reportBody" class="report"></div>
   <footer>
     <button type="button" class="btn ghost" id="btnCloseReport">关闭</button>
+  </footer>
+</dialog>
+
+<!-- 代理检测结果 -->
+<dialog id="proxyDlg">
+  <h2>代理检测</h2>
+  <div id="proxyBody" class="report"></div>
+  <footer>
+    <button type="button" class="btn ghost" id="btnCloseProxy">关闭</button>
   </footer>
 </dialog>
 

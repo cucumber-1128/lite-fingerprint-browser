@@ -35,16 +35,39 @@ function toast(msg, isErr) {
 
 /* --------------------------------- 渲染 --------------------------------- */
 
+let filterText = '';
+let filterGroup = '';
+
+function visibleProfiles() {
+  const q = filterText.trim().toLowerCase();
+  return (state.profiles || []).filter((p) => {
+    if (filterGroup && (p.group || '') !== filterGroup) return false;
+    if (!q) return true;
+    const hay = [p.name, p.group, p.platform, p.timezone, p.locale, p.proxy && p.proxy.host, p.id]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    return hay.indexOf(q) >= 0;
+  });
+}
+
 function render() {
   const grid = $('#grid');
-  const list = state.profiles || [];
+  const all = state.profiles || [];
+  const list = visibleProfiles();
+  const filtered = all.length > 0 && list.length !== all.length;
+
   $('#empty').hidden = list.length > 0;
+  $('#empty').innerHTML = all.length
+    ? '<p>没有匹配的环境。</p><p>清空搜索框或切回「全部分组」。</p>'
+    : '<p>还没有环境。</p><p>点右上角「新建环境」，每个环境有独立的 Cookie 存储、独立的指纹、独立的代理。</p>';
 
   $('#hint').innerHTML =
     '浏览器内核：<b>' +
     (state.browserPath ? esc(state.browserPath) : '未找到，请安装 Chrome 或用 FB_BROWSER 指定') +
     '</b> · 每个环境使用独立 <b>user-data-dir</b>，Cookie / 缓存 / 登录态互不相通；' +
-    '指纹在 Chromium 原生层（UA、UA-CH、时区、locale）与主世界脚本（Canvas、WebGL、Audio、屏幕）两层同时伪装。';
+    '指纹在 Chromium 原生层（UA、UA-CH、时区、locale）与主世界脚本（Canvas、WebGL、Audio、字体、屏幕）两层同时伪装。' +
+    (filtered ? ' · 当前筛选出 <b>' + list.length + '</b> / ' + all.length + ' 个环境。' : '');
 
   if (editingId === null) {
     $('#browserVer').textContent = state.browserPath
@@ -56,15 +79,14 @@ function render() {
     .map((p) => {
       const running = !!p.running;
       const proxy = p.proxy || {};
-      const proxyText =
-        proxy.type && proxy.type !== 'none' && proxy.host
-          ? proxy.type.toUpperCase() + ' ' + proxy.host + ':' + proxy.port
-          : '直连';
+      const hasProxy = proxy.type && proxy.type !== 'none' && proxy.host;
+      const proxyText = hasProxy ? proxy.type.toUpperCase() + ' ' + proxy.host + ':' + proxy.port : '直连';
       const scr = p.screen || {};
       return `
       <article class="card ${running ? 'running' : ''}" data-id="${esc(p.id)}">
         <div class="card-head">
           <span class="name">${esc(p.name)}</span>
+          ${p.group ? `<span class="tag group" title="分组">${esc(p.group)}</span>` : ''}
           <span class="tag ${running ? 'on' : 'off'}">${running ? '运行中' : '已停止'}</span>
           <span class="tag">${esc(p.platform)}</span>
         </div>
@@ -82,12 +104,26 @@ function render() {
               : `<button class="btn primary" data-act="launch">启动</button>
                  <button class="btn" data-act="probe" disabled title="先启动环境">检测指纹</button>`
           }
+          ${hasProxy ? `<button class="btn" data-act="proxy-test">测代理</button>` : ''}
+          <button class="btn ghost" data-act="clone">克隆</button>
           <button class="btn ghost" data-act="edit">编辑</button>
           <button class="btn ghost danger" data-act="delete">删除</button>
         </div>
       </article>`;
     })
     .join('');
+}
+
+/** 分组下拉：随时按现有分组重建，但保留当前选择 */
+function renderGroupFilter() {
+  const sel = $('#groupFilter');
+  const cur = sel.value;
+  const groups = [...new Set((state.profiles || []).map((p) => (p.group || '').trim()).filter(Boolean))].sort();
+  sel.innerHTML =
+    '<option value="">全部分组</option>' +
+    groups.map((g) => '<option value="' + esc(g) + '">' + esc(g) + '</option>').join('');
+  sel.value = groups.includes(cur) ? cur : '';
+  filterGroup = sel.value;
 }
 
 let renderedJson = '';
@@ -100,6 +136,7 @@ async function load(force) {
     // 数据没变就不重绘：以前每 6s 把整张卡片列表 innerHTML 重建一遍
     if (force || json !== renderedJson) {
       renderedJson = json;
+      renderGroupFilter();
       render();
     }
   } catch (e) {
@@ -137,6 +174,7 @@ function openEditor(profile) {
     const s = profile.screen || {};
     const px = profile.proxy || {};
     setVal('name', profile.name);
+    setVal('group', profile.group || '');
     setVal('startUrl', profile.startUrl);
     setVal('platform', profile.platform);
     setVal('timezone', profile.timezone);
@@ -158,6 +196,7 @@ function openEditor(profile) {
     setVal('canvasNoise', profile.canvasNoise !== false);
     setVal('audioNoise', profile.audioNoise !== false);
     setVal('textNoise', profile.textNoise !== false);
+    setVal('fontNoise', profile.fontNoise !== false);
     setVal('rectNoise', profile.rectNoise === true);
     setVal('proxyType', px.type || 'none');
     setVal('proxyHost', px.host);
@@ -166,6 +205,7 @@ function openEditor(profile) {
     pwInput.placeholder = px.hasPassword ? '已保存，留空表示不修改' : '';
   } else {
     setVal('name', '');
+    setVal('group', '');
     setVal('startUrl', 'about:blank');
     setVal('platform', 'win');
     setVal('timezone', 'Asia/Shanghai');
@@ -187,6 +227,7 @@ function openEditor(profile) {
     setVal('canvasNoise', true);
     setVal('audioNoise', true);
     setVal('textNoise', true);
+    setVal('fontNoise', true);
     setVal('rectNoise', false);
     setVal('proxyType', 'none');
     setVal('proxyHost', '');
@@ -219,6 +260,7 @@ function readEditor() {
 
   return {
     name: getVal('name').trim(),
+    group: getVal('group').trim(),
     startUrl: getVal('startUrl').trim() || 'about:blank',
     platform: getVal('platform'),
     timezone: getVal('timezone').trim() || 'Asia/Shanghai',
@@ -242,6 +284,7 @@ function readEditor() {
     canvasNoise: getVal('canvasNoise'),
     audioNoise: getVal('audioNoise'),
     textNoise: getVal('textNoise'),
+    fontNoise: getVal('fontNoise'),
     rectNoise: getVal('rectNoise'),
     proxy,
   };
@@ -306,6 +349,24 @@ async function onCardAction(id, act, btn) {
       btn.textContent = '检测指纹';
       return;
     }
+    if (act === 'clone') {
+      btn.disabled = true;
+      const copy = await api('/api/profiles/' + id + '/clone', { method: 'POST' });
+      await load(true);
+      return toast('已克隆为「' + copy.name + '」（换了新 seed，指纹与 Cookie 都是新的）');
+    }
+    if (act === 'proxy-test') {
+      btn.disabled = true;
+      btn.textContent = '测试中…';
+      try {
+        const r = await api('/api/profiles/' + id + '/proxy-test', { method: 'POST' });
+        showProxyResult(r);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '测代理';
+      }
+      return;
+    }
   } catch (e) {
     toast(e.message, true);
     btn.disabled = false;
@@ -333,6 +394,7 @@ const LABELS = {
   webglVendor: 'WebGL 厂商',
   webglRenderer: 'WebGL 渲染器',
   glMaxTextureSize: 'WebGL 最大纹理',
+  fontCheck: '字体探测（Arial / 微软雅黑 / 不存在的字体）',
   gpuVendor: 'WebGPU GPU 家族',
   gpuArch: 'WebGPU 架构',
   speechVoiceCount: '语音合成数量',
@@ -365,6 +427,31 @@ function showReport(r) {
   $('#report').showModal();
 }
 
+/* ------------------------------- 代理检测 ------------------------------- */
+
+function showProxyResult(r) {
+  const rows = [];
+  const add = (k, v) => rows.push('<div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + '</div>');
+
+  if (!r.ok) {
+    add('结果', '失败');
+    add('原因', r.error || '未知错误');
+    add('耗时', (r.ms || 0) + ' ms');
+  } else {
+    add('结果', '可用');
+    add('出口 IP', r.ip || '(未获取)');
+    add('国家 / 城市', [r.country, r.city].filter(Boolean).join(' / ') || '-');
+    add('运营商', r.isp || '-');
+    add('耗时', (r.ms || 0) + ' ms');
+    if (r.directIp) {
+      add('直连 IP', r.directIp);
+      add('是否泄漏', r.leaked ? '⚠ 代理没生效，出口和直连一样' : '否（出口与直连不同）');
+    }
+  }
+  $('#proxyBody').innerHTML = rows.join('');
+  $('#proxyDlg').showModal();
+}
+
 /* -------------------------------- 事件绑定 -------------------------------- */
 
 document.addEventListener('click', (e) => {
@@ -380,7 +467,57 @@ $('#btnRefresh').addEventListener('click', () => load(true));
 $('#btnCancel').addEventListener('click', () => $('#editor').close());
 $('#btnSave').addEventListener('click', saveEditor);
 $('#btnCloseReport').addEventListener('click', () => $('#report').close());
+$('#btnCloseProxy').addEventListener('click', () => $('#proxyDlg').close());
 $('#editorForm').querySelector('[name="userAgentMode"]').addEventListener('change', syncUaWrap);
+
+/* ------------------------------ 搜索 / 分组 ------------------------------ */
+
+$('#search').addEventListener('input', (e) => {
+  filterText = e.target.value;
+  render();
+});
+$('#groupFilter').addEventListener('change', (e) => {
+  filterGroup = e.target.value;
+  render();
+});
+
+/* ------------------------------ 导入 / 导出 ------------------------------ */
+
+async function exportProfiles() {
+  try {
+    const res = await fetch('/api/export');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'fb-profiles-' + new Date().toISOString().slice(0, 10) + '.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    toast('已导出（不含代理密码，导入后需重新填写）');
+  } catch (e) {
+    toast('导出失败：' + e.message, true);
+  }
+}
+
+async function importProfiles(e) {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  try {
+    const data = JSON.parse(await file.text());
+    const r = await api('/api/import', { method: 'POST', body: data });
+    await load(true);
+    toast('已导入 ' + r.imported + ' 个环境（代理密码需重新填写）');
+  } catch (err) {
+    toast('导入失败：' + err.message, true);
+  }
+}
+
+$('#btnExport').addEventListener('click', exportProfiles);
+$('#btnImport').addEventListener('click', () => $('#importFile').click());
+$('#importFile').addEventListener('change', importProfiles);
 
 $('#btnRandom').addEventListener('click', async () => {
   try {

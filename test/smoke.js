@@ -77,6 +77,41 @@ function staticChecks() {
   ok(!src.includes('__CFG__'), '__CFG__ 占位符已被替换');
   ok(src.includes('2560') && src.includes('Radeon RX 6600'), '指纹参数已写入脚本');
   ok(launcher.buildUserAgent(profile, '141.0.7390.55').includes('Chrome/141.0.0.0'), 'UA 用 Chrome 的 reduction 形态（完整版本只在 UA-CH 里）');
+
+  /* 字体白名单 / WebGL 档位 */
+  const macCfg = launcher.buildConfig({ platform: 'mac', seed: 's' });
+  const winCfg = launcher.buildConfig({ platform: 'win', seed: 's' });
+  ok(Array.isArray(macCfg.fontWhitelist) && macCfg.fontWhitelist.includes('PingFang SC'), 'mac 指纹带 macOS 字体白名单');
+  ok(!macCfg.fontWhitelist.includes('Microsoft YaHei'), 'mac 白名单不含 Windows 专属字体');
+  ok(winCfg.fontWhitelist.includes('Microsoft YaHei'), 'win 白名单含微软雅黑');
+  ok(src.includes('fontWhitelist') || src.includes('MAX_TEXTURE_SIZE') || src.includes('0x0d33'), '字体/WebGL 补丁已注入');
+
+  /* 克隆 / 导入导出 */
+  const cloneSrc = store.create({
+    name: 'clone-src',
+    group: 'g1',
+    proxy: { type: 'http', host: '1.1.1.1', port: '8080', username: 'u', password: 'secret123' },
+  });
+  const copy = store.clone(cloneSrc.id);
+  ok(copy && copy.id !== cloneSrc.id, '克隆产生新 id');
+  ok(copy && copy.seed !== cloneSrc.seed, '克隆换了新 seed（Canvas/Audio 噪声跟着变）');
+  ok(copy && copy.group === 'g1' && copy.proxy.host === '1.1.1.1', '克隆保留分组与代理配置');
+
+  const exported = store.exportAll();
+  const exportedJson = JSON.stringify(exported);
+  ok(exported.length >= 2, '导出包含所有环境');
+  ok(!exportedJson.includes('secret123'), '导出不含代理密码');
+  ok(!exportedJson.includes('"createdAt"'), '导出不含时间戳');
+
+  const imported = store.importAll([
+    { name: 'imp1', group: 'g2', seed: 'x', proxy: { type: 'socks5', host: '2.2.2.2', port: '1080', password: 'drop-me' } },
+  ]);
+  ok(imported.length === 1 && !!imported[0].id, '导入分配了新 id');
+  ok(imported[0].group === 'g2', '导入保留分组');
+  ok(imported[0].proxy.password === '', '导入清空代理密码');
+  ok(store.list().filter((p) => p.name.indexOf('imp1') >= 0).length === 1, '导入的环境已落库');
+
+  for (const id of [cloneSrc.id, copy.id, imported[0].id]) store.remove(id);
 }
 
 /* ---------------------------- 2. 代理中继自检 ---------------------------- */
@@ -507,6 +542,15 @@ async function headerChecks() {
 
     ok(r.speechHasMicrosoft === false, '声明 macOS 后不再暴露 Windows SAPI 语音');
     ok(r.speechHasMac === true, '语音设备列表换成了 macOS 那一套');
+
+    console.log('     字体探测        Arial=' + JSON.stringify(r.fontCheck && r.fontCheck.arial) +
+      ' 微软雅黑=' + JSON.stringify(r.fontCheck && r.fontCheck.yahei) +
+      ' 不存在字体=' + JSON.stringify(r.fontCheck && r.fontCheck.missing));
+    console.log('     WebGL 能力      MAX_TEXTURE_SIZE=' + r.glMaxTextureSize);
+    ok(r.fontCheck && r.fontCheck.arial === true, 'mac 环境里 Arial 仍可探测到');
+    ok(r.fontCheck && r.fontCheck.yahei === false, 'mac 环境里查不到微软雅黑（字体列表按声明平台过滤）');
+    ok(r.fontCheck && r.fontCheck.missing === false, '不存在的字体查不到');
+    eq(r.glMaxTextureSize, 16384, 'WebGL 最大纹理与声明的 GPU 档位一致');
     if (r.gpuVendor !== undefined) {
       const declared = String(p.webglVendor || '');
       const expectGpu = /Apple/.test(declared)

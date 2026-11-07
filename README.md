@@ -72,9 +72,11 @@ npm test                            # 跑冒烟测试（会真的启动两个浏
 | `screen.*` / `devicePixelRatio` | `Screen.prototype` / `window` getter 重定义；`outerWidth`/`outerHeight` **不伪造**（窗口本来就是按屏幕比例开的真实尺寸，钉成整屏反而会出现真窗口不可能有的 `outer - inner` 差值） |
 | **Canvas** 指纹 | 24 个像素的定点 LSB 扰动，按环境 seed 确定性生成（同一环境每次一样，不同环境不一样） |
 | **WebGL** 厂商/渲染器 | `getParameter` 覆写 37445/37446 及 VENDOR/RENDERER |
-| **Audio** 指纹 | `AudioBuffer.getChannelData` 加 1e-7 级噪声、`AnalyserNode` 加噪 |
+| **WebGL 能力值** | `MAX_TEXTURE_SIZE` / `MAX_CUBE_MAP_TEXTURE_SIZE` / `MAX_RENDERBUFFER_SIZE` / `MAX_VIEWPORT_DIMS` 按声明的 GPU 档位对齐，不让"渲染器写 RTX 4060、能力值却是软渲染的 8192" |
+| **Audio** 指纹 | `getChannelData` 与 `copyFromChannel` 加同一套 1e-7 级噪声（按采样序号算，两个 API 读到的偏移一致）、`AnalyserNode` 加噪 |
 | 字体测量 | `measureText().width` ±0.01px 确定性偏移 |
-| **WebRTC** IP 泄漏 | 三种模式：跟随代理改写候选 / 禁用候选 / 不处理；外加启动参数 `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` |
+| **字体列表** | `document.fonts.check()` 按声明平台的白名单过滤 + `measureText` 对未知字体回退到 Arial/Helvetica：Windows 上跑 macOS 指纹时查不到微软雅黑/宋体这一套 |
+| **WebRTC** IP 泄漏 | 三种模式：跟随代理改写候选 / 禁用候选 / 不处理；候选地址按环境 seed 派生（不是全网一个 `192.168.1.88`），`toJSON()` 一并覆盖（否则 `JSON.stringify(pc.localDescription)` 是现成的绕过口）；外加 `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` |
 | `navigator.webdriver` | 启动参数 + getter 双保险 |
 | 元素坐标（可选，默认关） | `getBoundingClientRect` 亚像素偏移 |
 
@@ -199,16 +201,23 @@ Chrome ──(无认证, 127.0.0.1)──▶ 本地中继 ──(带 Proxy-Autho
 
 ## 诚实的边界
 
-**能做到的**：绕过绝大多数基于 JS 的指纹采集 —— Canvas / WebGL / Audio / 屏幕 / CPU 内存 / 时区 / 语言 / UA-CH 的一致性伪装。
+**能做到的**：绕过绝大多数基于 JS 的指纹采集 —— Canvas / WebGL（含能力值）/ Audio / 字体列表 / 屏幕 / CPU 内存 / 时区 / 语言 / UA-CH 的一致性伪装。
 
 **做不到的**（需要改 Chromium C++ 源码，属于另一个工程量级）：
 
 - **TLS 指纹（JA3/JA4）与 HTTP/2 指纹** —— 这由内核决定，JS 和 CDP 都改不了。想对付高强度风控，还是要用真改过内核的方案。
-- **GPU 的真实深度指纹** —— WebGL 的 `RENDERER` 字符串能改，但某些驱动层面的细节仍可能与声明不一致。
-- **已安装字体列表** —— 没做伪造（本项目用真实浏览器，字体列表是真机的，这点反而自然，但会和声称的 macOS 对不上，所以别在 Windows 上选 macOS）。
+- **GPU 的真实深度指纹** —— WebGL 的 `RENDERER` 字符串和能力值能改，但驱动层面的细节（着色器精度、抗锯齿行为）仍可能与声明不一致。
+- **用 CSS 量字宽的字体探测** —— `document.fonts.check()` 和 canvas `measureText()` 已经按白名单过滤，但"给 span 设字体再看 `offsetWidth`"这种纯 DOM 测法绕过补丁，需要在 CSSOM 层改写（没做）。
 - **同一台机器上的多个环境仍共用同一个出口网卡** —— 必须自己配不同代理 IP 才算真正隔离。
 
-**建议**：同一台机器上，一个环境配一个独立代理 IP，选择与指纹自洽的时区/语言（美国 IP 就别配 Asia/Tokyo 时区）。
+**建议**：同一台机器上，一个环境配一个独立代理 IP，选择与指纹自洽的时区/语言（美国 IP 就别配 Asia/Tokyo 时区）。配好之后点卡片上的「测代理」，直接看出口 IP 和国家——如果出口和直连一样，说明代理没生效。
+
+## 环境管理
+
+- **克隆**：一键复制配置，但会换一个新 seed（Canvas/Audio 噪声和 WebRTC 假 IP 跟着变）；Cookie 不复制，等于"同一台机器的另一台"。
+- **导出 / 导入**：`/api/export` 输出可迁移的 JSON，**不含代理密码**（密码只写不读），导入后密码留空需要重新填。
+- **搜索 / 分组**：顶部搜索框按名称、分组、代理、时区过滤；拖动下拉框按分组筛选。分组在编辑器里填。
+- **测代理**：卡片上的「测代理」会经本地中继真实请求一次 `ipinfo.io`（被限流时自动退到 `ip-api.com`），显示出口 IP、国家/城市、运营商、耗时，并和直连 IP 对比判断是否"假代理"。
 
 ## 目录结构
 

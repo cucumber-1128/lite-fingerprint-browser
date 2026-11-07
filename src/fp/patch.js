@@ -202,7 +202,147 @@
     }, 'measureText');
   }
 
+  /* ---------------------------------- 字体 ----------------------------------- */
+  /**
+   * 字体探测只有两条路：`document.fonts.check()` 和 `measureText()` 的宽度差。
+   * 把"声明平台没有的字体"当成不存在：check 返回 false，measureText 按回退字体量，
+   * 这样在 Windows 上跑 macOS 指纹时，不会露出 Microsoft YaHei / SimSun 这一套系统字体。
+   */
+  if (CFG.fontNoise !== false && typeof FontFaceSet !== 'undefined') {
+    var FONT_LIST = CFG.fontWhitelist || [];
+    var FALLBACK_FAMILY = CFG.platform === 'mac' ? 'Helvetica' : 'Arial';
+    var GENERIC_FAMILIES = {
+      serif: 1, 'sans-serif': 1, monospace: 1, cursive: 1, fantasy: 1,
+      'system-ui': 1, 'ui-serif': 1, 'ui-sans-serif': 1, 'ui-monospace': 1, 'ui-rounded': 1,
+      '-apple-system': 1, blinkmacsystemfont: 1, inherit: 1, initial: 1, unset: 1,
+    };
+    var allowedFonts = {};
+    for (var fi = 0; fi < FONT_LIST.length; fi++) {
+      allowedFonts[String(FONT_LIST[fi]).toLowerCase()] = 1;
+    }
+
+    function bareFamily(name) {
+      return String(name || '').replace(/^["']|["']$/g, '').trim();
+    }
+    /**
+     * 网页自己用 @font-face 声明的 webfont（Roboto、Noto Sans SC 之类）不能拦：
+     * 很多站点靠 document.fonts.check() 判断字体加载完了没，误判会让它们一直等。
+     */
+    function isDeclaredFamily(name) {
+      try {
+        if (!document.fonts || !document.fonts.size) return false;
+        var target = bareFamily(name).toLowerCase();
+        var hit = false;
+        document.fonts.forEach(function (face) {
+          if (hit || !face) return;
+          if (bareFamily(face.family).toLowerCase() === target) hit = true;
+        });
+        return hit;
+      } catch (e) {
+        return false;
+      }
+    }
+    function isAllowedFamily(name) {
+      var key = bareFamily(name).toLowerCase();
+      if (!key) return true;
+      return !!GENERIC_FAMILIES[key] || !!allowedFonts[key] || isDeclaredFamily(key);
+    }
+    /** 从 font 简写里切出家族列表（保留字号/行高，只替换家族） */
+    function splitFont(font) {
+      var sizeMatch = /(\d*\.?\d+(?:px|pt|pc|em|rem|%))/.exec(font);
+      if (!sizeMatch) return null;
+      var cut = sizeMatch.index + sizeMatch[0].length;
+      var head = font.slice(0, cut);
+      var tail = font.slice(cut);
+      var lh = '';
+      var lhMatch = /^\s*\/\s*\S+/.exec(tail);
+      if (lhMatch) {
+        lh = lhMatch[0];
+        tail = tail.slice(lhMatch[0].length);
+      }
+      var families = tail.split(',').map(function (s) {
+        return s.trim();
+      }).filter(Boolean);
+      return { head: head + lh + ' ', families: families };
+    }
+    function filterFont(font) {
+      if (!font || typeof font !== 'string') return font;
+      var parts = splitFont(font);
+      if (!parts || !parts.families.length) return font;
+      var kept = parts.families.filter(isAllowedFamily);
+      if (!kept.length) kept = ['"' + FALLBACK_FAMILY + '"'];
+      return parts.head + kept.join(', ');
+    }
+    function firstFamily(font) {
+      var parts = splitFont(font);
+      if (!parts || !parts.families.length) return '';
+      return bareFamily(parts.families[0]);
+    }
+
+    var origCheck = FontFaceSet.prototype.check;
+    if (origCheck) {
+      FontFaceSet.prototype.check = mask(function check(font) {
+        try {
+          var fam = firstFamily(String(font || ''));
+          if (fam && !isAllowedFamily(fam)) return false;
+        } catch (e) {
+          /* ignore */
+        }
+        return origCheck.apply(this, arguments);
+      }, 'check');
+    }
+
+    function patchMeasureText(proto) {
+      if (!proto || !proto.measureText) return;
+      var orig = proto.measureText;
+      proto.measureText = mask(function measureText() {
+        var before = null;
+        try {
+          before = this.font;
+          var after = filterFont(before);
+          if (after !== before) this.font = after;
+        } catch (e) {
+          before = null;
+        }
+        try {
+          return orig.apply(this, arguments);
+        } finally {
+          if (before !== null) {
+            try {
+              this.font = before;
+            } catch (e) {
+              /* ignore */
+            }
+          }
+        }
+      }, 'measureText');
+    }
+    patchMeasureText(typeof CanvasRenderingContext2D !== 'undefined' ? CanvasRenderingContext2D.prototype : null);
+    patchMeasureText(
+      typeof OffscreenCanvasRenderingContext2D !== 'undefined' ? OffscreenCanvasRenderingContext2D.prototype : null
+    );
+  }
+
   /* ---------------------------------- WebGL ---------------------------------- */
+
+  // 声明了哪家 GPU，下面这些"能力值"就得像那个档位；
+  // 否则会出现"渲染器写着 RTX 4060，MAX_TEXTURE_SIZE 却是软渲染的 8192"。
+  var GL_TIER = {
+    NVIDIA: { tex: 16384, view: 32767, rb: 16384 },
+    AMD: { tex: 16384, view: 32767, rb: 16384 },
+    Intel: { tex: 16384, view: 32767, rb: 16384 },
+    Apple: { tex: 16384, view: 32767, rb: 16384 },
+  };
+  var glTier = null;
+  (function () {
+    var decl = String(CFG.webglVendor || '');
+    for (var key in GL_TIER) {
+      if (Object.prototype.hasOwnProperty.call(GL_TIER, key) && decl.indexOf(key) >= 0) {
+        glTier = GL_TIER[key];
+        break;
+      }
+    }
+  })();
 
   function patchGL(proto) {
     if (!proto || !proto.getParameter) return;
@@ -212,6 +352,12 @@
       if (p === 37446) return CFG.webglRenderer;
       if (p === 7936) return 'WebKit';
       if (p === 7937) return 'WebKit WebGL';
+      if (glTier) {
+        if (p === 0x0d33) return glTier.tex; // MAX_TEXTURE_SIZE
+        if (p === 0x851c) return glTier.tex; // MAX_CUBE_MAP_TEXTURE_SIZE
+        if (p === 0x84e8) return glTier.rb; // MAX_RENDERBUFFER_SIZE
+        if (p === 0x0d3a) return new Int32Array([glTier.view, glTier.view]); // MAX_VIEWPORT_DIMS
+      }
       return orig.apply(this, arguments);
     }, 'getParameter');
 

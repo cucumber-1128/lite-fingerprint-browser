@@ -41,6 +41,35 @@ const PLATFORM_UA = {
   },
 };
 
+/** 各平台"干净系统"自带的字体。声明了哪个平台，就只让这些字体被探测到 */
+const FONT_POOL = {
+  win: [
+    'Arial', 'Arial Black', 'Calibri', 'Cambria', 'Cambria Math', 'Candara', 'Comic Sans MS',
+    'Consolas', 'Constantia', 'Corbel', 'Courier New', 'Ebrima', 'Franklin Gothic Medium',
+    'Gabriola', 'Georgia', 'Impact', 'Lucida Console', 'Lucida Sans Unicode', 'Malgun Gothic',
+    'Microsoft Himalaya', 'Microsoft JhengHei', 'Microsoft Sans Serif', 'Microsoft YaHei',
+    'MingLiU', 'MS Gothic', 'MV Boli', 'Nirmala UI', 'Palatino Linotype', 'Segoe Print',
+    'Segoe Script', 'Segoe UI', 'SimSun', 'Sylfaen', 'Tahoma', 'Times New Roman',
+    'Trebuchet MS', 'Verdana', 'Webdings', 'Wingdings', 'Yu Gothic',
+  ],
+  mac: [
+    'Helvetica', 'Helvetica Neue', 'Arial', 'Arial Black', 'Arial Rounded MT Bold', 'Avenir',
+    'Avenir Next', 'Baskerville', 'Big Caslon', 'Bradley Hand', 'Chalkboard', 'Chalkduster',
+    'Cochin', 'Comic Sans MS', 'Copperplate', 'Courier', 'Courier New', 'Didot', 'Futura',
+    'Geneva', 'Georgia', 'Gill Sans', 'Hoefler Text', 'Impact', 'Lucida Grande', 'Luminari',
+    'Marker Felt', 'Menlo', 'Monaco', 'Optima', 'Palatino', 'Papyrus', 'Rockwell',
+    'Snell Roundhand', 'Tahoma', 'Times', 'Times New Roman', 'Trebuchet MS', 'Verdana',
+    'Zapfino', 'PingFang SC', 'PingFang TC', 'Hiragino Sans', 'Hiragino Sans GB',
+    'Hiragino Mincho ProN', 'STHeiti', 'Songti SC', 'Heiti SC', 'Apple SD Gothic Neo',
+    'Apple Color Emoji', 'SF Pro Text', 'SF Pro Display',
+  ],
+  linux: [
+    'DejaVu Sans', 'DejaVu Serif', 'DejaVu Sans Mono', 'Liberation Sans', 'Liberation Serif',
+    'Liberation Mono', 'Noto Sans', 'Noto Serif', 'Noto Sans CJK SC', 'Ubuntu', 'Cantarell',
+    'FreeSans', 'FreeSerif', 'FreeMono', 'Droid Sans', 'WenQuanYi Micro Hei',
+  ],
+};
+
 /** profileId -> 运行中实例 */
 const running = new Map();
 
@@ -323,6 +352,8 @@ function buildConfig(profile) {
     canvasNoise: profile.canvasNoise !== false,
     audioNoise: profile.audioNoise !== false,
     textNoise: profile.textNoise !== false,
+    fontNoise: profile.fontNoise !== false,
+    fontWhitelist: FONT_POOL[profile.platform] || FONT_POOL.win,
     rectNoise: profile.rectNoise === true,
     webrtc: profile.webrtc || 'proxy',
     fakeIp: deriveFakeIp(profile.seed || 'seed'),
@@ -967,6 +998,14 @@ const PROBE_EXPR = `(async () => {
     out.webglRenderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(0x1f01);
     out.glMaxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
   } catch (e) { out.webglError = String(e); }
+  // 字体探测：声明平台里不该有的字体必须查不到（白名单在注入脚本里）
+  try {
+    out.fontCheck = {
+      arial: document.fonts.check('12px Arial'),
+      yahei: document.fonts.check('12px "Microsoft YaHei"'),
+      missing: document.fonts.check('12px "__fb_missing_font__"')
+    };
+  } catch (e) { out.fontError = String(e); }
   // WebGPU：真机上会暴露真实 GPU 家族，是"设备级"标识里最硬的一个
   try {
     if (navigator.gpu) {

@@ -8,6 +8,8 @@
  */
 const net = require('node:net');
 const http = require('node:http');
+const tls = require('node:tls');
+const https = require('node:https');
 
 function basicAuth(user, pass) {
   return 'Basic ' + Buffer.from(String(user) + ':' + String(pass)).toString('base64');
@@ -365,4 +367,171 @@ async function createRelay(upstream, opts = {}) {
   };
 }
 
-module.exports = { createRelay, socks5Connect };
+/* ------------------------------ 出口 IP 探测 ------------------------------ */
+
+/** 在本地中继上开一条到目标的隧道（CONNECT），返回裸 socket */
+function tunnelTo(relayPort, targetHost, targetPort, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ host: '127.0.0.1', port: relayPort });
+    let buf = '';
+    let settled = false;
+    const fail = (msg) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      reject(new Error(msg));
+    };
+    sock.setTimeout(timeoutMs, () => fail('通过代理建隧道超时'));
+    sock.on('error', (e) => fail('代理隧道错误：' + e.message));
+    sock.on('connect', () => {
+      sock.write(
+        'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n\r\n'
+      );
+    });
+    sock.on('data', function onData(chunk) {
+      buf += chunk.toString('latin1');
+      const idx = buf.indexOf('\r\n\r\n');
+      if (idx < 0) {
+        if (buf.length > 16384) fail('代理响应头过大');
+        return;
+      }
+      sock.removeListener('data', onData);
+      const first = (buf.slice(0, idx).split('\r\n')[0] || '').split(/\s+/);
+      const code = parseInt(first[1], 10);
+      if (code !== 200) return fail('上游代理拒绝 CONNECT（' + code + '）');
+      settled = true;
+      sock.setTimeout(0);
+      const rest = Buffer.from(buf.slice(idx + 4), 'latin1');
+      if (rest.length) sock.unshift(rest);
+      resolve(sock);
+    });
+  });
+}
+
+/** GET 一个 JSON 接口；relayPort 为 0 时直连 */
+function fetchJson(url, relayPort, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const isHttps = u.protocol === 'https:';
+    const timer = setTimeout(() => reject(new Error('请求超时')), timeoutMs);
+
+    const finish = (err, data) => {
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(data);
+    };
+
+    const send = (socket) => {
+      const opts = {
+        host: u.hostname,
+        path: u.pathname + u.search,
+        method: 'GET',
+        headers: {
+          host: u.hostname,
+          accept: 'application/json',
+          'user-agent': 'lite-fingerprint-browser/0.1',
+          connection: 'close',
+        },
+        timeout: timeoutMs,
+      };
+      if (socket) {
+        opts.agent = false;
+        opts.createConnection = () => socket;
+      }
+      const req = (socket ? http : https).request(opts, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => (body += c));
+        res.on('end', () => {
+          try {
+            finish(null, { status: res.statusCode, json: JSON.parse(body) });
+          } catch {
+            finish(new Error('返回的不是 JSON（HTTP ' + res.statusCode + '）'));
+          }
+        });
+      });
+      req.on('error', (e) => finish(e));
+      req.on('timeout', () => req.destroy(new Error('请求超时')));
+      req.end();
+    };
+
+    if (!relayPort) return send(null);
+
+    tunnelTo(relayPort, u.hostname, isHttps ? 443 : 80, timeoutMs)
+      .then((sock) => {
+        if (!isHttps) return send(sock);
+        const t = tls.connect({ socket: sock, servername: u.hostname }, () => send(t));
+        t.on('error', (e) => finish(e));
+        t.setTimeout(timeoutMs, () => t.destroy(new Error('TLS 握手超时')));
+        return null;
+      })
+      .catch((e) => finish(e));
+  });
+}
+
+/**
+ * 测一个代理能不能用、出口 IP 是多少、是不是"假代理"（出口和直连一样）。
+ * 走真实网络，只在这个按钮被点的时候发生。
+ */
+async function testProxy(upstream, opts = {}) {
+  const timeoutMs = opts.timeoutMs || 6000;
+  const started = Date.now();
+  let relay = null;
+  try {
+    relay = await createRelay(upstream);
+  } catch (e) {
+    return { ok: false, error: e.message, ms: Date.now() - started };
+  }
+
+  let data = null;
+  let error = null;
+  try {
+    const first = await fetchJson('https://ipinfo.io/json', relay.port, timeoutMs);
+    if (first && first.json && first.json.ip) {
+      data = first.json;
+    } else {
+      // 接口能连上但没给 ip（多半是限流）：换一个接口再试；
+      // 连不上就直接失败，不再多等一个超时
+      const second = await fetchJson(
+        'http://ip-api.com/json/?fields=status,country,regionName,city,isp,query',
+        relay.port,
+        timeoutMs
+      );
+      data = (second && second.json) || null;
+    }
+  } catch (e) {
+    error = e;
+  } finally {
+    try {
+      await relay.close();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (error) return { ok: false, error: error.message, ms: Date.now() - started };
+  const d = data || {};
+  const ip = d.ip || d.query || '';
+  const result = {
+    ok: !!ip,
+    ip,
+    country: d.country || '',
+    city: d.city || d.regionName || '',
+    isp: d.isp || d.org || '',
+    ms: Date.now() - started,
+    directIp: '',
+    leaked: false,
+  };
+
+  // 直连再取一次：如果出口 IP 和直连一样，说明代理其实没生效
+  try {
+    const direct = await fetchJson('https://ipinfo.io/json', 0, Math.min(timeoutMs, 5000));
+    result.directIp = (direct && direct.json && direct.json.ip) || '';
+    result.leaked = !!(ip && result.directIp && ip === result.directIp);
+  } catch {
+    /* 直连失败就不比了 */
+  }
+  return result;
+}
+
+module.exports = { createRelay, socks5Connect, testProxy };

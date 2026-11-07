@@ -7,6 +7,7 @@ const { URL } = require('node:url');
 
 const store = require('./store');
 const launcher = require('./launch');
+const { testProxy } = require('./proxy');
 const { findBrowser } = require('./browser');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -159,6 +160,34 @@ function createServer() {
           return json(res, 200, store.randomFingerprint(body.platform));
         }
 
+        // 导出：不含密码，可迁移到另一台机器
+        if (method === 'GET' && pathname === '/api/export') {
+          const body = JSON.stringify(
+            { version: 1, exportedAt: new Date().toISOString(), profiles: store.exportAll() },
+            null,
+            2
+          );
+          res.writeHead(200, {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': Buffer.byteLength(body),
+            'content-disposition': 'attachment; filename="fb-profiles.json"',
+            'cache-control': 'no-store',
+          });
+          return res.end(body);
+        }
+
+        if (method === 'POST' && pathname === '/api/import') {
+          const body = await readBody(req);
+          const items = Array.isArray(body)
+            ? body
+            : body && Array.isArray(body.profiles)
+              ? body.profiles
+              : null;
+          if (!items) return json(res, 400, { error: '导入文件里没有 profiles 数组' });
+          const created = store.importAll(items);
+          return json(res, 200, { imported: created.length, profiles: created.map(withRunning) });
+        }
+
         if (method === 'POST' && pathname === '/api/profiles') {
           const body = await readBody(req);
           const p = store.create(body);
@@ -204,6 +233,29 @@ function createServer() {
           if (method === 'POST' && action === 'probe') {
             const report = await launcher.probe(id);
             return json(res, 200, report);
+          }
+
+          if (method === 'POST' && action === 'clone') {
+            const p = store.clone(id);
+            if (!p) return json(res, 404, { error: '环境不存在' });
+            return json(res, 200, withRunning(p));
+          }
+
+          if (method === 'POST' && action === 'proxy-test') {
+            const p = store.get(id);
+            if (!p) return json(res, 404, { error: '环境不存在' });
+            const px = p.proxy || {};
+            if (px.type === 'none' || !px.host || !px.port) {
+              return json(res, 400, { error: '这个环境没有配置代理' });
+            }
+            const result = await testProxy({
+              type: px.type,
+              host: px.host,
+              port: px.port,
+              username: px.username,
+              password: px.password,
+            });
+            return json(res, 200, result);
           }
         }
 

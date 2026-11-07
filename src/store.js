@@ -153,6 +153,7 @@ function defaults(input = {}) {
   return {
     id: uid(),
     name: input.name || '新环境',
+    group: String(input.group || '').trim(),
     startUrl: input.startUrl || 'about:blank',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -172,6 +173,8 @@ function defaults(input = {}) {
 
     canvasNoise: true,
     audioNoise: true,
+    textNoise: true,
+    fontNoise: true, // 字体列表：只在"声明平台 ≠ 真实平台"时生效
     webrtc: 'proxy', // proxy | disabled | real
     rectNoise: false,
 
@@ -254,6 +257,48 @@ function profileDir(id) {
   return path.join(PROFILE_ROOT, id);
 }
 
+/* ------------------------------ 克隆 / 导入导出 ------------------------------ */
+
+/**
+ * 复制一个环境：配置全抄，但换一个新 seed。
+ * seed 换了，Canvas/Audio 噪声和 WebRTC 假 IP 都会跟着变 —— 等于"同一台机器的另一台"
+ * （同一个 seed 复制出来会让两个环境指纹完全一样，反而更容易被聚类）。
+ * Cookie 不会复制：user-data-dir 是新的。
+ */
+function clone(id) {
+  const src = get(id);
+  if (!src) return null;
+  const { id: _id, createdAt: _c, updatedAt: _u, ...rest } = src;
+  return create({ ...rest, name: (src.name || '环境') + '（副本）', seed: crypto.randomBytes(8).toString('hex') });
+}
+
+/** 导出可迁移的配置：不含密码（密码只写不读），也不带 id/时间戳 */
+function exportAll() {
+  return list().map((p) => {
+    const { id: _id, createdAt: _c, updatedAt: _u, proxy, ...rest } = p;
+    return {
+      ...rest,
+      proxy: proxy
+        ? { type: proxy.type, host: proxy.host, port: proxy.port, username: proxy.username }
+        : { type: 'none', host: '', port: '', username: '' },
+    };
+  });
+}
+
+/** 导入：全部当新环境处理（重新分配 id），密码留空等用户补 */
+function importAll(items) {
+  const out = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== 'object') continue;
+    const { id: _id, createdAt: _c, updatedAt: _u, ...rest } = item;
+    if (rest.proxy && typeof rest.proxy === 'object') {
+      rest.proxy = { ...rest.proxy, password: '' };
+    }
+    out.push(create(rest));
+  }
+  return out;
+}
+
 module.exports = {
   ROOT,
   DATA,
@@ -262,6 +307,9 @@ module.exports = {
   create,
   update,
   remove,
+  clone,
+  exportAll,
+  importAll,
   profileDir,
   randomFingerprint,
   TIMEZONES,

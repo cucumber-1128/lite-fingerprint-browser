@@ -45,7 +45,11 @@ body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46vw;
 }
 
-.actions { display: flex; gap: 8px; flex-shrink: 0; }
+.actions { display: flex; gap: 8px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; align-items: center; }
+
+.search { width: 190px; padding: 6px 10px; font-size: 13px; }
+.group-filter { width: 130px; padding: 6px 8px; font-size: 13px; }
+.tag.group { color: var(--accent-2); border-color: #1d3a5c; background: #0f1a26; }
 
 .btn {
   border: 1px solid var(--line);
