@@ -1,12 +1,29 @@
 'use strict';
 /** 环境（profile）配置存储：data/profiles.json + 每个环境独立的 user-data-dir */
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const ROOT = path.resolve(__dirname, '..');
-// 数据目录可用 FB_DATA 覆盖：测试、双开、放移动硬盘都用得上
-const DATA = process.env.FB_DATA ? path.resolve(process.env.FB_DATA) : path.join(ROOT, 'data');
+// 打包成 exe 后，数据目录跟着 exe 走（绿色版）；不可写时退到 %LOCALAPPDATA%
+const ROOT = process.env.FB_APP_ROOT ? path.resolve(process.env.FB_APP_ROOT) : path.resolve(__dirname, '..');
+
+function pickDataDir(root) {
+  if (process.env.FB_DATA) return path.resolve(process.env.FB_DATA);
+  const local = path.join(root, 'data');
+  try {
+    fs.mkdirSync(local, { recursive: true });
+    fs.accessSync(local, fs.constants.W_OK);
+    return local;
+  } catch {
+    /* 比如把 exe 放进了 Program Files，就地写不进去 */
+  }
+  const alt = path.join(process.env.LOCALAPPDATA || os.tmpdir(), 'lite-fingerprint-browser');
+  fs.mkdirSync(alt, { recursive: true });
+  return alt;
+}
+
+const DATA = pickDataDir(ROOT);
 const FILE = path.join(DATA, 'profiles.json');
 const PROFILE_ROOT = path.join(DATA, 'profiles');
 

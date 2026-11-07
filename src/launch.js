@@ -10,6 +10,7 @@ const { spawn } = require('node:child_process');
 const { CDP } = require('./cdp');
 const { findBrowser } = require('./browser');
 const { createRelay } = require('./proxy');
+const runtime = require('./runtime');
 const store = require('./store');
 
 const PATCH_FILE = path.join(__dirname, 'fp', 'patch.js');
@@ -362,7 +363,8 @@ function buildConfig(profile) {
 
 /** 读取并校验注入脚本，把 __CFG__ 替换成该环境的指纹参数 */
 function buildInjectionSource(profile) {
-  const tpl = fs.readFileSync(PATCH_FILE, 'utf8');
+  const tpl = runtime.readAsset('src/fp/patch.js');
+  if (!tpl) throw new Error('找不到注入脚本 src/fp/patch.js（打包时漏了？）');
   const cfg = buildConfig(profile);
   // 用函数式替换：JSON 里若出现 $& / $1 之类，字符串替换会被当成替换模式
   const src = tpl.replace('__CFG__', () => JSON.stringify(cfg));

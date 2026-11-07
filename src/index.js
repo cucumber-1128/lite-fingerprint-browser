@@ -11,6 +11,9 @@
  *   node src/index.js stop-all        关掉所有已启动环境
  */
 const { spawn } = require('node:child_process');
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
 const { createServer } = require('./server');
 const store = require('./store');
 const launcher = require('./launch');
@@ -36,6 +39,54 @@ function openBrowser(url) {
   } catch {
     /* ignore */
   }
+}
+
+/**
+ * 用 Chrome/Edge 的 app 模式打开控制台：没有地址栏、没有标签栏，任务栏里就是一个独立窗口。
+ * 这就是"轻量客户端"的外观，但不用背 Electron/Tauri 那套运行时。
+ */
+function openAppWindow(url) {
+  const browser = findBrowser();
+  if (!browser) return false;
+  try {
+    spawn(browser, ['--app=' + url, '--window-size=1180,820', '--window-position=80,60'], {
+      stdio: 'ignore',
+      detached: true,
+    }).unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 已经有一个控制台在跑？避免双击两次起两个实例互相覆盖 profiles.json */
+function liveConsole() {
+  let info;
+  try {
+    info = JSON.parse(fs.readFileSync(path.join(store.DATA, 'console.json'), 'utf8'));
+  } catch {
+    return Promise.resolve(null);
+  }
+  if (!info || !info.port || !info.pid) return Promise.resolve(null);
+  try {
+    process.kill(info.pid, 0);
+  } catch {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    const req = http.get(
+      { host: '127.0.0.1', port: info.port, path: '/api/state', timeout: 1200 },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode === 200 ? info : null);
+      }
+    );
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
 }
 
 async function main() {
@@ -89,6 +140,19 @@ async function main() {
 
   /* 默认：起控制台 */
   const port = Number(flag('port', 0)) || 0;
+  const wantOpen = flag('open', true) !== false && flag('no-open', false) === false;
+
+  // 双击第二次时不要起第二个实例：直接打开已经在跑的那个
+  if (!port) {
+    const live = await liveConsole();
+    if (live) {
+      const u = 'http://127.0.0.1:' + live.port;
+      console.log('控制台已经在运行：' + u);
+      if (wantOpen && !openAppWindow(u)) openBrowser(u);
+      return;
+    }
+  }
+
   const server = createServer();
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
   const actual = server.address().port;
@@ -103,10 +167,28 @@ async function main() {
   console.log('  按 Ctrl+C 退出（会一并关闭已启动的环境）');
   console.log('');
 
-  if (flag('open', true) !== false && flag('no-open', false) === false) openBrowser(url);
+  const consoleFile = path.join(store.DATA, 'console.json');
+  try {
+    fs.mkdirSync(store.DATA, { recursive: true });
+    fs.writeFileSync(consoleFile, JSON.stringify({ pid: process.pid, port: actual, startedAt: Date.now() }), 'utf8');
+  } catch {
+    /* 写不进去也不影响运行 */
+  }
 
+  if (wantOpen) {
+    if (!openAppWindow(url)) openBrowser(url);
+  }
+
+  let stopping = false;
   const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
     console.log('\n正在关闭已启动的环境…');
+    try {
+      fs.rmSync(consoleFile, { force: true });
+    } catch {
+      /* ignore */
+    }
     await launcher.stopAll();
     server.close();
     process.exit(0);

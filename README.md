@@ -50,6 +50,24 @@ node src/index.js --port 8787       # 指定控制台端口
 npm test                            # 跑冒烟测试（会真的启动两个浏览器）
 ```
 
+## 打包成客户端（单文件 exe）
+
+```bash
+npm install            # 只为装打包用的 postject，运行时依然零依赖
+npm run build          # → dist/LiteFingerprint.exe（约 87 MB）
+```
+
+给别人的就这一个文件：拷过去双击即可，目标机器**不需要装 Node**，有 Chrome 或 Edge 就行（Win10/11 自带 Edge）。
+
+- 第一次运行会在 exe 旁边生成 `data/`（环境配置、user-data-dir、日志）；exe 放在不可写目录（比如 Program Files）时自动退到 `%LOCALAPPDATA%\lite-fingerprint-browser`。
+- 控制台用 Chrome/Edge 的 **app 模式**打开：没有地址栏、没有标签页，任务栏里就是一个独立窗口，观感和 Electron/Tauri 一样，但不用背那套运行时。找不到浏览器时退回默认浏览器。
+- 双击第二次不会起第二个实例，只会把已经在跑的控制台再开一个窗口。
+- 关掉黑窗口，或者点界面右上角的「退出」，都会把已启动的环境一起关掉。
+- exe 未签名，Windows 第一次会弹 SmartScreen：**更多信息 → 仍要运行**。介意的话自己签个名。
+- 打包产物**和平台相关**：在 macOS / Linux 上跑同一个 `npm run build` 会得到对应平台的可执行文件。
+
+为什么不用 Tauri / Electron：本项目的后端全是 Node API（CDP WebSocket、代理中继、`spawn` 拉起 Chrome），Tauri 只能把 Node 当 sidecar 塞进去（5 MB 壳 + 87 MB Node），比直接用 SEA 还大；Electron 内嵌 Chromium 更是 150 MB 起步。SEA 是"零额外运行时"的唯一解，代价就是 exe 里带着 Node 运行时。
+
 ## 它到底改了哪些指纹
 
 分两层做，这是关键设计：

@@ -519,6 +519,18 @@ $('#btnExport').addEventListener('click', exportProfiles);
 $('#btnImport').addEventListener('click', () => $('#importFile').click());
 $('#importFile').addEventListener('change', importProfiles);
 
+$('#btnQuit').addEventListener('click', async () => {
+  if (!confirm('退出控制台？已启动的环境会被一起关闭。')) return;
+  try {
+    await api('/api/shutdown', { method: 'POST', body: {} });
+  } catch {
+    /* 服务已经退出，请求失败是正常的 */
+  }
+  document.body.innerHTML =
+    '<div style="padding:80px 24px;text-align:center;color:#8b949e;font:14px/1.8 sans-serif">' +
+    '控制台已退出。重新打开程序即可继续。</div>';
+});
+
 $('#btnRandom').addEventListener('click', async () => {
   try {
     const r = await api('/api/random', { method: 'POST', body: {} });

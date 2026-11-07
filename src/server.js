@@ -7,10 +7,9 @@ const { URL } = require('node:url');
 
 const store = require('./store');
 const launcher = require('./launch');
+const runtime = require('./runtime');
 const { testProxy } = require('./proxy');
 const { findBrowser } = require('./browser');
-
-const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -58,24 +57,20 @@ function readBody(req) {
 }
 
 function serveStatic(req, res, pathname) {
-  let rel = pathname === '/' ? '/index.html' : pathname;
-  const file = path.join(PUBLIC_DIR, path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
-  if (!file.startsWith(PUBLIC_DIR)) {
-    res.writeHead(403).end('forbidden');
+  const rel = pathname === '/' ? '/index.html' : pathname;
+  const safe = path.normalize(rel).replace(/^(\.\.[/\\])+/, '').replace(/\\/g, '/');
+  const key = path.posix.join('public', safe);
+  const body = runtime.readAsset(key);
+  if (body === null) {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('404 Not Found');
     return;
   }
-  fs.readFile(file, (err, data) => {
-    if (err) {
-      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end('404 Not Found');
-      return;
-    }
-    res.writeHead(200, {
-      'content-type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
-      'cache-control': 'no-store',
-    });
-    res.end(data);
+  res.writeHead(200, {
+    'content-type': MIME[path.extname(key).toLowerCase()] || 'application/octet-stream',
+    'cache-control': 'no-store',
   });
+  res.end(body);
 }
 
 /** 密码只写不读：接口只回 hasPassword，前端留空表示"不修改已保存的密码" */
@@ -158,6 +153,20 @@ function createServer() {
         if (method === 'POST' && pathname === '/api/random') {
           const body = await readBody(req);
           return json(res, 200, store.randomFingerprint(body.platform));
+        }
+
+        if (method === 'POST' && pathname === '/api/shutdown') {
+          json(res, 200, { ok: true });
+          // 先把响应发出去，再关环境退出；不然页面会看到连接被掐断
+          setTimeout(async () => {
+            try {
+              await launcher.stopAll();
+            } catch {
+              /* ignore */
+            }
+            process.exit(0);
+          }, 250);
+          return;
         }
 
         // 导出：不含密码，可迁移到另一台机器
