@@ -1,6 +1,6 @@
 {
   "name": "lite-fingerprint-browser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "零依赖轻量指纹浏览器：独立环境 + 指纹伪装 + 独立代理，复用本机 Chromium",
   "main": "src/index.js",
@@ -10,12 +10,16 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node test/smoke.js",
-    "build": "node scripts/build.js"
+    "build": "node scripts/build.js",
+    "client:prepare": "node scripts/prepare-tauri.js",
+    "client:dev": "npm run client:prepare && tauri dev",
+    "client:build": "npm run client:prepare && tauri build"
   },
   "engines": {
     "node": ">=22"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
     "postject": "^1.0.0-alpha.6"
   }
 }

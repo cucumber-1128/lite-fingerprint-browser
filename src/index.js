@@ -141,12 +141,23 @@ async function main() {
   /* 默认：起控制台 */
   const port = Number(flag('port', 0)) || 0;
   const wantOpen = flag('open', true) !== false && flag('no-open', false) === false;
+  // 被 Tauri 之类的壳子当 sidecar 拉起时：只往 stdout 吐一行 FB_READY {...}，不弹浏览器
+  const machine = flag('machine', false) === true;
+
+  const say = (line) => {
+    if (machine) process.stdout.write(line + '\n');
+    else console.log(line);
+  };
 
   // 双击第二次时不要起第二个实例：直接打开已经在跑的那个
   if (!port) {
     const live = await liveConsole();
     if (live) {
       const u = 'http://127.0.0.1:' + live.port;
+      if (machine) {
+        say('FB_READY ' + JSON.stringify({ url: u, port: live.port, reused: true }));
+        return;
+      }
       console.log('控制台已经在运行：' + u);
       if (wantOpen && !openAppWindow(u)) openBrowser(u);
       return;
@@ -158,15 +169,6 @@ async function main() {
   const actual = server.address().port;
   const url = 'http://127.0.0.1:' + actual;
 
-  const chrome = findBrowser();
-  console.log('');
-  console.log('  轻量指纹浏览器 · 控制台已启动');
-  console.log('  ' + url);
-  console.log('  浏览器内核: ' + (chrome || '未找到（请安装 Chrome 或用 FB_BROWSER 指定）'));
-  console.log('  环境数据: ' + store.DATA);
-  console.log('  按 Ctrl+C 退出（会一并关闭已启动的环境）');
-  console.log('');
-
   const consoleFile = path.join(store.DATA, 'console.json');
   try {
     fs.mkdirSync(store.DATA, { recursive: true });
@@ -175,15 +177,27 @@ async function main() {
     /* 写不进去也不影响运行 */
   }
 
-  if (wantOpen) {
-    if (!openAppWindow(url)) openBrowser(url);
+  if (machine) {
+    say('FB_READY ' + JSON.stringify({ url, port: actual, dataDir: store.DATA, pid: process.pid }));
+  } else {
+    const chrome = findBrowser();
+    console.log('');
+    console.log('  轻量指纹浏览器 · 控制台已启动');
+    console.log('  ' + url);
+    console.log('  浏览器内核: ' + (chrome || '未找到（请安装 Chrome 或用 FB_BROWSER 指定）'));
+    console.log('  环境数据: ' + store.DATA);
+    console.log('  按 Ctrl+C 退出（会一并关闭已启动的环境）');
+    console.log('');
+    if (wantOpen) {
+      if (!openAppWindow(url)) openBrowser(url);
+    }
   }
 
   let stopping = false;
   const shutdown = async () => {
     if (stopping) return;
     stopping = true;
-    console.log('\n正在关闭已启动的环境…');
+    if (!machine) console.log('\n正在关闭已启动的环境…');
     try {
       fs.rmSync(consoleFile, { force: true });
     } catch {
@@ -195,6 +209,17 @@ async function main() {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  // sidecar 模式：父进程（壳子）退出时 stdin 会关掉，据此优雅收工
+  if (machine) {
+    process.stdin.on('end', shutdown);
+    process.stdin.on('close', shutdown);
+    try {
+      process.stdin.resume();
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 main().catch((e) => {

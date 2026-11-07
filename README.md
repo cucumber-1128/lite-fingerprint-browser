@@ -50,7 +50,11 @@ node src/index.js --port 8787       # 指定控制台端口
 npm test                            # 跑冒烟测试（会真的启动两个浏览器）
 ```
 
-## 打包成客户端（单文件 exe）
+## 打包成客户端
+
+两条路，按需要选。
+
+### A. 单文件 exe（最省事）
 
 ```bash
 npm install            # 只为装打包用的 postject，运行时依然零依赖
@@ -59,14 +63,27 @@ npm run build          # → dist/LiteFingerprint.exe（约 87 MB）
 
 给别人的就这一个文件：拷过去双击即可，目标机器**不需要装 Node**，有 Chrome 或 Edge 就行（Win10/11 自带 Edge）。
 
-- 第一次运行会在 exe 旁边生成 `data/`（环境配置、user-data-dir、日志）；exe 放在不可写目录（比如 Program Files）时自动退到 `%LOCALAPPDATA%\lite-fingerprint-browser`。
-- 控制台用 Chrome/Edge 的 **app 模式**打开：没有地址栏、没有标签页，任务栏里就是一个独立窗口，观感和 Electron/Tauri 一样，但不用背那套运行时。找不到浏览器时退回默认浏览器。
+- 第一次运行会在 exe 旁边生成 `data/`；exe 放在不可写目录（比如 Program Files）时自动退到 `%LOCALAPPDATA%\lite-fingerprint-browser`。
+- 控制台用 Chrome/Edge 的 **app 模式**打开：没有地址栏、没有标签页，任务栏里就是一个独立窗口。
 - 双击第二次不会起第二个实例，只会把已经在跑的控制台再开一个窗口。
 - 关掉黑窗口，或者点界面右上角的「退出」，都会把已启动的环境一起关掉。
-- exe 未签名，Windows 第一次会弹 SmartScreen：**更多信息 → 仍要运行**。介意的话自己签个名。
-- 打包产物**和平台相关**：在 macOS / Linux 上跑同一个 `npm run build` 会得到对应平台的可执行文件。
+- exe 未签名，Windows 第一次会弹 SmartScreen：**更多信息 → 仍要运行**。
 
-为什么不用 Tauri / Electron：本项目的后端全是 Node API（CDP WebSocket、代理中继、`spawn` 拉起 Chrome），Tauri 只能把 Node 当 sidecar 塞进去（5 MB 壳 + 87 MB Node），比直接用 SEA 还大；Electron 内嵌 Chromium 更是 150 MB 起步。SEA 是"零额外运行时"的唯一解，代价就是 exe 里带着 Node 运行时。
+### B. Tauri 客户端（真 WebView2 窗口 + 安装包）
+
+```bash
+npm run client:dev     # 开发模式（热改前端即刻生效）
+npm run client:build   # → src-tauri/target/release/bundle/nsis/LiteFingerprint_*_x64-setup.exe
+```
+
+需要三样东西：**Rust**（stable-msvc）、**VS Build Tools**（C++ 生成工具）、**WebView2 运行时**（Win10/11 自带）。
+
+- `src-tauri/` 只是一个很薄的壳：拉起 sidecar（就是 A 里的那个 Node 单文件程序）→ 从 stdout 读到 `FB_READY {"url":...}` → 建 WebView2 窗口加载它。所以没有白屏，也不用把端口写死。
+- sidecar 由 `npm run client:prepare` 生成：先跑 SEA 打包，再按 Tauri 的命名规则复制成 `src-tauri/binaries/fb-<target-triple>.exe`。
+- 关窗口时壳子退出 → sidecar 的 stdin 关闭 → 优雅关掉已启动的环境。
+- 体积：Tauri 壳约 5 MB + Node sidecar 约 87 MB ≈ **92 MB**；换来的是正规安装包、图标、没有黑窗口控制台，也方便以后加托盘和自动更新。
+
+本机装不了工具链的话，可以走 GitHub Actions：在 Actions 里手动跑 `build-client`，或推一个 `v*` tag，产物在 Artifacts 里（`LiteFingerprint_*_x64-setup.exe`）。
 
 ## 它到底改了哪些指纹
 
