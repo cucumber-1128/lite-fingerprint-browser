@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>轻量指纹浏览器</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>轻量指纹浏览器</h1>
+    <span class="ver" id="browserVer">读取内核中…</span>
+  </div>
+  <div class="actions">
+    <button class="btn ghost" id="btnRefresh">刷新</button>
+    <button class="btn primary" id="btnNew">+ 新建环境</button>
+  </div>
+</header>
+
+<main>
+  <section class="hint" id="hint"></section>
+  <section class="grid" id="grid"></section>
+  <section class="empty" id="empty" hidden>
+    <p>还没有环境。</p>
+    <p>点右上角「新建环境」，每个环境有独立的 Cookie 存储、独立的指纹、独立的代理。</p>
+  </section>
+</main>
+
+<!-- 环境编辑 -->
+<dialog id="editor">
+  <form method="dialog" id="editorForm">
+    <h2 id="editorTitle">新建环境</h2>
+
+    <div class="row">
+      <label>名称
+        <input name="name" placeholder="例如 店铺A-美国" required />
+      </label>
+      <label>起始页
+        <input name="startUrl" placeholder="about:blank" />
+      </label>
+    </div>
+
+    <h3>指纹
+      <button type="button" class="btn tiny" id="btnRandom">随机一套</button>
+    </h3>
+
+    <div class="row">
+      <label>系统平台
+        <select name="platform">
+          <option value="win">Windows</option>
+          <option value="mac">macOS</option>
+          <option value="linux">Linux</option>
+        </select>
+      </label>
+      <label>时区
+        <input name="timezone" placeholder="Asia/Shanghai" list="tzList" />
+      </label>
+    </div>
+    <datalist id="tzList"></datalist>
+
+    <div class="row">
+      <label>语言（逗号分隔，第一个为主语言）
+        <input name="languages" placeholder="zh-CN,zh,en-US,en" />
+      </label>
+      <label>Locale
+        <input name="locale" placeholder="zh-CN" />
+      </label>
+    </div>
+
+    <div class="row four">
+      <label>屏宽<input name="screenWidth" type="number" /></label>
+      <label>屏高<input name="screenHeight" type="number" /></label>
+      <label>可用高<input name="screenAvailHeight" type="number" /></label>
+      <label>DPR<input name="pixelRatio" type="number" step="0.25" /></label>
+    </div>
+
+    <div class="row four">
+      <label>CPU 核数<input name="hardwareConcurrency" type="number" /></label>
+      <label>内存 GB<input name="deviceMemory" type="number" /></label>
+      <label>触点数<input name="maxTouchPoints" type="number" /></label>
+      <label>色深<input name="colorDepth" type="number" /></label>
+    </div>
+
+    <div class="row">
+      <label>WebGL 厂商<input name="webglVendor" /></label>
+      <label>WebGL 渲染器<input name="webglRenderer" /></label>
+    </div>
+
+    <div class="row">
+      <label>User-Agent 模式
+        <select name="userAgentMode">
+          <option value="auto">自动（跟随本机内核版本号）</option>
+          <option value="custom">自定义</option>
+        </select>
+      </label>
+      <label>WebRTC
+        <select name="webrtc">
+          <option value="proxy">跟随代理（改写候选地址）</option>
+          <option value="disabled">禁用（不产生候选地址）</option>
+          <option value="real">不处理（可能泄漏真实 IP）</option>
+        </select>
+      </label>
+    </div>
+
+    <label class="full" id="uaWrap">自定义 UA
+      <input name="userAgentCustom" placeholder="留空则自动生成" />
+    </label>
+
+    <div class="checks">
+      <label><input type="checkbox" name="canvasNoise" /> Canvas 噪声</label>
+      <label><input type="checkbox" name="audioNoise" /> Audio 噪声</label>
+      <label><input type="checkbox" name="textNoise" /> 字体测量噪声</label>
+      <label><input type="checkbox" name="rectNoise" /> 元素坐标噪声（进阶，可能影响布局判断）</label>
+    </div>
+
+    <h3>代理</h3>
+    <div class="row">
+      <label>类型
+        <select name="proxyType">
+          <option value="none">不使用</option>
+          <option value="http">HTTP / HTTPS</option>
+          <option value="socks5">SOCKS5</option>
+        </select>
+      </label>
+      <label>主机
+        <input name="proxyHost" placeholder="127.0.0.1" />
+      </label>
+    </div>
+    <div class="row">
+      <label>端口<input name="proxyPort" placeholder="7890" /></label>
+      <label>用户名<input name="proxyUsername" autocomplete="off" /></label>
+      <label>密码<input name="proxyPassword" type="password" autocomplete="new-password" /></label>
+    </div>
+
+    <footer>
+      <span class="err" id="editorErr"></span>
+      <button type="button" class="btn ghost" id="btnCancel">取消</button>
+      <button type="button" class="btn primary" id="btnSave">保存</button>
+    </footer>
+  </form>
+</dialog>
+
+<!-- 指纹检测结果 -->
+<dialog id="report">
+  <h2>指纹检测结果</h2>
+  <div id="reportBody" class="report"></div>
+  <footer>
+    <button type="button" class="btn ghost" id="btnCloseReport">关闭</button>
+  </footer>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "lite-fingerprint-browser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "零依赖轻量指纹浏览器：独立环境 + 指纹伪装 + 独立代理，复用本机 Chromium",
+  "main": "src/index.js",
+  "bin": { "fb": "src/index.js" },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/smoke.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {}
+}
