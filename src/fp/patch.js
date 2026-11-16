@@ -64,11 +64,12 @@
 
   /* -------------------------------- navigator -------------------------------- */
 
+  // webdriver 不动。启动时用固定调试端口，原生值就是 false。
+  // 这里再 defineProperty，iframe 里的 Function#toString 能看到假 getter，Google 登录会拒。
   defineGetters(Navigator.prototype, {
     hardwareConcurrency: CFG.hardwareConcurrency,
     deviceMemory: CFG.deviceMemory,
     maxTouchPoints: CFG.maxTouchPoints,
-    webdriver: false,
   });
 
   /* ---------------------------------- screen --------------------------------- */

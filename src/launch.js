@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
+const net = require('node:net');
 const { CDP } = require('./cdp');
 const { findBrowser } = require('./browser');
 const { createRelay } = require('./proxy');
@@ -379,11 +380,43 @@ function buildInjectionSource(profile) {
 
 /* ------------------------------- DevTools 端口 ------------------------------- */
 
-async function waitForDevTools(userDataDir, proc, timeoutMs = 25000) {
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const p = srv.address().port;
+      srv.close(() => resolve(p));
+    });
+  });
+}
+
+/** 固定端口时 Chrome 不写 DevToolsActivePort，用 /json/version 拿浏览器级 websocket */
+async function browserWs(port) {
+  const res = await fetch('http://127.0.0.1:' + port + '/json/version', {
+    signal: AbortSignal.timeout(800),
+  });
+  if (!res.ok) return '';
+  const info = await res.json();
+  return info.webSocketDebuggerUrl || '';
+}
+
+async function waitForDevTools(userDataDir, proc, timeoutMs = 25000, knownPort = 0) {
   const file = path.join(userDataDir, 'DevToolsActivePort');
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (proc.exitCode !== null) throw new Error('浏览器启动后立即退出（exit ' + proc.exitCode + '）');
+    if (knownPort) {
+      try {
+        const wsUrl = await browserWs(knownPort);
+        if (wsUrl) {
+          await sleep(120);
+          return { port: knownPort, wsUrl };
+        }
+      } catch {
+        /* 还没起来 */
+      }
+    }
     try {
       const txt = fs.readFileSync(file, 'utf8');
       const lines = txt.split('\n').map((s) => s.trim());
@@ -561,7 +594,7 @@ async function reattach() {
       continue;
     }
 
-    // 端口只从 user-data-dir 里的 DevToolsActivePort 读，注册表里的可能已经过期
+    // 临时端口（0）会写 DevToolsActivePort；固定端口不写，退回注册表里记下的端口
     let wsUrl = '';
     let port = 0;
     try {
@@ -572,7 +605,15 @@ async function reattach() {
       port = parseInt(lines[0], 10) || 0;
       if (port > 0 && lines[1]) wsUrl = 'ws://127.0.0.1:' + port + lines[1];
     } catch {
-      /* 没有就是没在跑 */
+      /* 固定端口不会生成这个文件 */
+    }
+    if (!wsUrl && meta.port) {
+      try {
+        wsUrl = await browserWs(meta.port);
+        if (wsUrl) port = meta.port;
+      } catch {
+        /* 进程已经没了 */
+      }
     }
     if (!wsUrl) {
       forget(id);
@@ -732,14 +773,19 @@ async function launch(profileId, options = {}) {
     });
   }
 
+  // 固定端口。写 0 的话 Chrome 会打开 AutomationControlled，navigator.webdriver 变成 true
+  const debugPort = await freePort();
+
   /* 2. 组装参数 */
   const args = [
     '--user-data-dir=' + userDataDir,
-    '--remote-debugging-port=0',
+    '--remote-debugging-port=' + debugPort,
     '--remote-debugging-address=127.0.0.1',
     '--no-first-run',
     '--no-default-browser-check',
-    '--disable-blink-features=AutomationControlled',
+    // 不要加 --disable-blink-features=AutomationControlled。
+    // 那个参数会出黄条，Google 登录直接拒。也不要用 JS 覆写 webdriver：
+    // 原生值已经是 false，假 getter 会被跨 realm 的 toString 识破。
     '--disable-features=Translate,MediaRouter,OptimizationHints',
     '--disable-session-crashed-bubble',
     '--hide-crash-restore-bubble',
@@ -791,7 +837,7 @@ async function launch(profileId, options = {}) {
 
   try {
     /* 4. 连上 DevTools */
-    const { port, wsUrl } = await waitForDevTools(userDataDir, proc);
+    const { port, wsUrl } = await waitForDevTools(userDataDir, proc, 25000, debugPort);
     instance.port = port;
     const cdp = await CDP.connect(wsUrl);
     instance.cdp = cdp;

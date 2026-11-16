@@ -137,7 +137,7 @@ node src/index.js import backup.json --json
 | 字体测量 | `measureText().width` ±0.01px 确定性偏移 |
 | **字体列表** | `document.fonts.check()` 按声明平台的白名单过滤 + `measureText` 对未知字体回退到 Arial/Helvetica：Windows 上跑 macOS 指纹时查不到微软雅黑/宋体这一套 |
 | **WebRTC** IP 泄漏 | 三种模式：跟随代理改写候选 / 禁用候选 / 不处理；候选地址按环境 seed 派生（不是全网一个 `192.168.1.88`），`toJSON()` 一并覆盖（否则 `JSON.stringify(pc.localDescription)` 是现成的绕过口）；外加 `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` |
-| `navigator.webdriver` | 启动参数 + getter 双保险 |
+| `navigator.webdriver` | 不改。调试端口用固定端口而不是 `0`，原生值就是 false。覆写 getter 会被 Google 登录识破；`--disable-blink-features=AutomationControlled` 也不能加，会出黄条并被拒签 |
 | 元素坐标（可选，默认关） | `getBoundingClientRect` 亚像素偏移 |
 
 所有补丁函数都会重写 `Function.prototype.toString`，让它们看起来是 `[native code]`。
@@ -304,7 +304,7 @@ fingerprint-browser/
 - **多开**：直接再点另一个环境的「启动」，互相独立。
 - **排查启动失败**：看 `data/logs/<环境id>.log`（Chrome 自己的 stderr）。
 - **重置某个环境**：删掉后重建（等于换了新机器）。
-- **控制台崩了/重启了**：浏览器进程是独立起来的（`detached`），控制台下次启动会按 `data/instances.json` + `DevToolsActivePort` 自动**接管**回来，卡片直接显示「运行中」，代理中继也会在原端口上重新拉起来。不用手动去任务管理器里杀残留。
+- **控制台崩了/重启了**：浏览器进程是独立起来的（`detached`），控制台下次启动会按 `data/instances.json` 里的调试端口（旧的临时端口还会读 `DevToolsActivePort`）自动**接管**回来，卡片直接显示「运行中」，代理中继也会在原端口上重新拉起来。不用手动去任务管理器里杀残留。
 - **换数据目录**：`FB_DATA=D:\fb-data node src/index.js`，测试脚本默认就写临时目录，不会碰你的环境。
 - **数据损坏**：`profiles.json` 解析失败时会先备份成 `profiles.json.corrupt-<时间戳>` 再放空库，不会把你所有环境覆盖掉。
 
