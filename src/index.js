@@ -27,8 +27,9 @@ const { PRESETS, getPreset, parseProxyLine, parseProxies, readJsonArg } = requir
 
 const argv = process.argv.slice(2);
 const jsonMode = hasFlag('json');
-const first = argv[0] && !String(argv[0]).startsWith('--') ? String(argv[0]).toLowerCase() : '';
-const cmd = first || (argv.includes('--help') || argv.includes('-h') ? 'help' : 'serve');
+const wantHelp = argv.includes('--help') || argv.includes('-h');
+const first = argv[0] && !String(argv[0]).startsWith('-') ? String(argv[0]).toLowerCase() : '';
+const cmd = wantHelp ? 'help' : first || 'serve';
 
 /* -------------------------------- 参数工具 -------------------------------- */
 
@@ -131,16 +132,88 @@ function liveConsole() {
   });
 }
 
+function consoleApi(live, method, apiPath, body, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const hasBody = method === 'POST' || method === 'PUT';
+    const payload = hasBody ? JSON.stringify(body === undefined ? {} : body) : null;
+    const headers = { 'content-type': 'application/json' };
+    if (payload !== null) headers['content-length'] = Buffer.byteLength(payload);
+    const req = http.request(
+      { host: '127.0.0.1', port: live.port, path: apiPath, method, headers, timeout: timeoutMs },
+      (res) => {
+        let raw = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => (raw += c));
+        res.on('end', () => {
+          let data = {};
+          try {
+            data = raw ? JSON.parse(raw) : {};
+          } catch {
+            data = {};
+          }
+          if (res.statusCode >= 400) {
+            reject(new Error(data.error || 'HTTP ' + res.statusCode));
+          } else {
+            resolve(data);
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('请求控制台超时：' + apiPath)));
+    if (payload !== null) req.write(payload);
+    req.end();
+  });
+}
+
+function selfSpawnArgs(extra) {
+  if (globalThis.__FB_ASSETS__) {
+    return { cmd: process.execPath, args: extra };
+  }
+  return { cmd: process.execPath, args: [__filename, ...extra] };
+}
+
+/** CLI launch 需要一个常驻进程维持 CDP autoAttach 与代理中继 */
+async function ensureDaemon() {
+  let live = await liveConsole();
+  if (live) return live;
+  const s = selfSpawnArgs(['serve', '--no-open', '--daemon']);
+  spawn(s.cmd, s.args, {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    env: process.env,
+  }).unref();
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+    live = await liveConsole();
+    if (live) return live;
+  }
+  throw new Error('后台守护进程启动超时');
+}
+
 /* --------------------------------- 命令 ---------------------------------- */
 
 async function cmdList() {
-  await launcher.reattach();
-  const rows = store.list().map((p) => {
-    const info = launcher.getRunning(p.id);
-    return { ...store.publicProfile(p), running: !!info, pid: info ? info.pid : null };
-  });
+  const live = await liveConsole();
+  let rows;
+  if (live) {
+    const st = await consoleApi(live, 'GET', '/api/state');
+    rows = (st.profiles || []).map((p) => {
+      const { instance, ...rest } = p;
+      return { ...rest, pid: instance ? instance.pid : null };
+    });
+  } else {
+    await launcher.reattach();
+    rows = store.list().map((p) => {
+      const info = launcher.getRunning(p.id);
+      return { ...store.publicProfile(p), running: !!info, pid: info ? info.pid : null };
+    });
+  }
+  const bin = globalThis.__FB_ASSETS__ ? path.basename(process.execPath) : 'node src/index.js';
   if (jsonMode) return emit({ ok: true, count: rows.length, profiles: rows });
-  if (!rows.length) return emit({ ok: true, count: 0 }, '还没有任何环境。例：node src/index.js create --name 店铺A --preset us-shop');
+  if (!rows.length) return emit({ ok: true, count: 0 }, '还没有任何环境。例：' + bin + ' create --name 店铺A --preset us-shop');
   const lines = ['ID             状态   平台   分组          名称'];
   for (const p of rows) {
     lines.push(
@@ -208,15 +281,27 @@ async function cmdClone(id) {
 }
 
 async function cmdRm(ids) {
-  await launcher.reattach();
   const target = ids.length ? ids : resolveTargets();
   if (!target.length) return fail('用法：rm <环境ID>... 或 --group <分组>');
+  const live = await liveConsole();
   const results = [];
-  for (const id of target) {
-    const existed = !!store.get(id);
-    if (existed) await launcher.stop(id);
-    const ok = existed && store.remove(id);
-    results.push({ id, ok });
+  if (live) {
+    for (const id of target) {
+      try {
+        const r = await consoleApi(live, 'DELETE', '/api/profiles/' + encodeURIComponent(id), undefined, 15000);
+        results.push({ id, ok: !!(r && r.ok) });
+      } catch {
+        results.push({ id, ok: false });
+      }
+    }
+  } else {
+    await launcher.reattach();
+    for (const id of target) {
+      const existed = !!store.get(id);
+      if (existed) await launcher.stop(id);
+      const ok = existed && store.remove(id);
+      results.push({ id, ok });
+    }
   }
   const removed = results.filter((r) => r.ok).length;
   return emit(
@@ -238,13 +323,19 @@ function resolveTargets() {
 }
 
 async function cmdLaunch() {
-  await launcher.reattach();
   const ids = resolveTargets();
   if (!ids.length) return fail('没有匹配的环境（用 ID、--group <分组> 或 --all）');
+  const live = await ensureDaemon();
   const results = [];
   for (const id of ids) {
     try {
-      const info = await launcher.launch(id);
+      const info = await consoleApi(
+        live,
+        'POST',
+        '/api/profiles/' + encodeURIComponent(id) + '/launch',
+        {},
+        35000
+      );
       results.push({
         id,
         ok: true,
@@ -264,23 +355,46 @@ async function cmdLaunch() {
 }
 
 async function cmdStop() {
-  await launcher.reattach();
+  const live = await liveConsole();
   if (hasFlag('all')) {
+    if (live) {
+      const st = await consoleApi(live, 'GET', '/api/state');
+      const ids = (st.running || []).map((r) => r.profileId);
+      for (const id of ids) {
+        await consoleApi(live, 'POST', '/api/profiles/' + encodeURIComponent(id) + '/stop', {}, 15000);
+      }
+      return emit({ ok: true, stopped: ids }, ids.length ? '已关闭：' + ids.join(', ') : '没有运行中的环境');
+    }
+    await launcher.reattach();
     const ids = await launcher.stopAll();
     return emit({ ok: true, stopped: ids }, ids.length ? '已关闭：' + ids.join(', ') : '没有运行中的环境');
   }
   const ids = resolveTargets();
   if (!ids.length) return fail('用法：stop <环境ID>... / --group <分组> / --all');
   const results = [];
-  for (const id of ids) results.push({ id, ok: await launcher.stop(id) });
+  if (live) {
+    for (const id of ids) {
+      const r = await consoleApi(live, 'POST', '/api/profiles/' + encodeURIComponent(id) + '/stop', {}, 15000);
+      results.push({ id, ok: !!(r && r.ok) });
+    }
+  } else {
+    await launcher.reattach();
+    for (const id of ids) results.push({ id, ok: await launcher.stop(id) });
+  }
   const stopped = results.filter((r) => r.ok).length;
   return emit({ ok: true, stopped, results }, stopped ? '✓ 已关闭 ' + stopped + ' 个环境' : '这些环境都没在运行');
 }
 
 async function cmdProbe(id) {
   if (!id) return fail('用法：probe <环境ID>');
-  await launcher.reattach();
-  const report = await launcher.probe(id);
+  const live = await liveConsole();
+  let report;
+  if (live) {
+    report = await consoleApi(live, 'POST', '/api/profiles/' + encodeURIComponent(id) + '/probe', {}, 25000);
+  } else {
+    await launcher.reattach();
+    report = await launcher.probe(id);
+  }
   const text = [
     '✓ ' + id + ' 指纹',
     '  UA        ' + report.userAgent,
@@ -343,7 +457,15 @@ async function cmdPresets() {
 }
 
 async function cmdDoctor() {
-  await launcher.reattach().catch(() => []);
+  const live = await liveConsole();
+  let running = [];
+  if (live) {
+    const st = await consoleApi(live, 'GET', '/api/state');
+    running = st.running || [];
+  } else {
+    await launcher.reattach().catch(() => []);
+    running = launcher.listRunning();
+  }
   const browser = findBrowser();
   let writable = true;
   try {
@@ -351,8 +473,6 @@ async function cmdDoctor() {
   } catch {
     writable = false;
   }
-  const live = await liveConsole();
-  const running = launcher.listRunning();
   const report = {
     ok: !!browser && writable,
     node: process.version,
@@ -376,25 +496,26 @@ async function cmdDoctor() {
 }
 
 function printHelp() {
+  const bin = globalThis.__FB_ASSETS__ ? path.basename(process.execPath) : 'node src/index.js';
   const lines = [
     '轻量指纹浏览器 · CLI',
     '',
     '  安装目录里跑 fb.exe，不要跑 LiteFingerprint.exe（那个只是窗口，参数不会进 CLI）。',
     '  数据在 exe 旁边的 data/。完整说明见同目录或源码仓库的 AGENTS.md。',
     '',
-    '  node src/index.js [serve] [--port N] [--no-open]   启动控制台（默认）',
-    '  node src/index.js list [--json]                    列出环境',
-    '  node src/index.js create --name 名称 [选项]         新建环境',
-    '  node src/index.js clone <id> [--name 名称]          克隆（换新 seed）',
-    '  node src/index.js rm <id>... | --group <g>          删除',
-    '  node src/index.js launch <id>... | --group <g>      启动',
-    '  node src/index.js stop <id>... | --group <g> | --all  关闭',
-    '  node src/index.js probe <id> [--json]               读一次真实指纹',
-    '  node src/index.js proxy-test <id> [--json]          测出口 IP',
-    '  node src/index.js export [文件.json]                导出（不含密码）',
-    '  node src/index.js import <文件.json>                导入',
-    '  node src/index.js presets [--json]                  列出地区预设',
-    '  node src/index.js doctor [--json]                   环境自检',
+    '  ' + bin + ' [serve] [--port N] [--no-open]   启动控制台（默认）',
+    '  ' + bin + ' list [--json]                    列出环境',
+    '  ' + bin + ' create --name 名称 [选项]         新建环境',
+    '  ' + bin + ' clone <id> [--name 名称]          克隆（换新 seed）',
+    '  ' + bin + ' rm <id>... | --group <g>          删除',
+    '  ' + bin + ' launch <id>... | --group <g>      启动',
+    '  ' + bin + ' stop <id>... | --group <g> | --all  关闭',
+    '  ' + bin + ' probe <id> [--json]               读一次真实指纹',
+    '  ' + bin + ' proxy-test <id> [--json]          测出口 IP',
+    '  ' + bin + ' export [文件.json]                导出（不含密码）',
+    '  ' + bin + ' import <文件.json>                导入',
+    '  ' + bin + ' presets [--json]                  列出地区预设',
+    '  ' + bin + ' doctor [--json]                   环境自检',
     '',
     'create 选项：',
     '  --preset us-shop      地区预设（presets 命令可列）',
@@ -413,12 +534,13 @@ function printHelp() {
 
 async function serve() {
   const port = Number(argValue('port') || 0) || 0;
-  const wantOpen = !hasFlag('no-open') && !hasFlag('machine');
+  const isDaemon = hasFlag('daemon');
   const machine = hasFlag('machine');
+  const wantOpen = !hasFlag('no-open') && !machine && !isDaemon;
 
   const say = (line) => {
     if (machine) process.stdout.write(line + '\n');
-    else console.log(line);
+    else if (!isDaemon) console.log(line);
   };
 
   if (!port) {
@@ -429,13 +551,19 @@ async function serve() {
         say('FB_READY ' + JSON.stringify({ url: u, port: live.port, reused: true }));
         return;
       }
-      console.log('控制台已经在运行：' + u);
+      if (!isDaemon) console.log('控制台已经在运行：' + u);
       if (wantOpen && !openAppWindow(u)) openBrowser(u);
       return;
     }
   }
 
-  const server = createServer();
+  await launcher.reattach().catch(() => []);
+  let uiVisited = false;
+  const server = createServer({
+    onUiVisit: () => {
+      uiVisited = true;
+    },
+  });
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
   const actual = server.address().port;
   const url = 'http://127.0.0.1:' + actual;
@@ -443,14 +571,18 @@ async function serve() {
   const consoleFile = path.join(store.DATA, 'console.json');
   try {
     fs.mkdirSync(store.DATA, { recursive: true });
-    fs.writeFileSync(consoleFile, JSON.stringify({ pid: process.pid, port: actual, startedAt: Date.now() }), 'utf8');
+    fs.writeFileSync(
+      consoleFile,
+      JSON.stringify({ pid: process.pid, port: actual, startedAt: Date.now(), daemon: isDaemon }),
+      'utf8'
+    );
   } catch {
     /* 写不进去也不影响运行 */
   }
 
   if (machine) {
     say('FB_READY ' + JSON.stringify({ url, port: actual, dataDir: store.DATA, pid: process.pid }));
-  } else {
+  } else if (!isDaemon) {
     const chrome = findBrowser();
     console.log('');
     console.log('  轻量指纹浏览器 · 控制台已启动');
@@ -468,7 +600,7 @@ async function serve() {
   const shutdown = async () => {
     if (stopping) return;
     stopping = true;
-    if (!machine) console.log('\n正在关闭已启动的环境…');
+    if (!machine && !isDaemon) console.log('\n正在关闭已启动的环境…');
     try {
       fs.rmSync(consoleFile, { force: true });
     } catch {
@@ -480,6 +612,25 @@ async function serve() {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  if (isDaemon) {
+    let everHadRunning = launcher.listRunning().length > 0;
+    let idleTicks = 0;
+    const idleTimer = setInterval(() => {
+      if (launcher.listRunning().length > 0) {
+        everHadRunning = true;
+        idleTicks = 0;
+        return;
+      }
+      if (uiVisited) return;
+      idleTicks++;
+      if ((everHadRunning && idleTicks >= 2) || idleTicks >= 20) {
+        clearInterval(idleTimer);
+        shutdown();
+      }
+    }, 1500);
+    if (typeof idleTimer.unref === 'function') idleTimer.unref();
+  }
 
   if (machine) {
     process.stdin.on('end', shutdown);
@@ -522,8 +673,18 @@ async function main() {
       await cmdStop();
       break;
     case 'stop-all': {
-      await launcher.reattach();
-      const ids = await launcher.stopAll();
+      const live = await liveConsole();
+      let ids;
+      if (live) {
+        const st = await consoleApi(live, 'GET', '/api/state');
+        ids = (st.running || []).map((r) => r.profileId);
+        for (const id of ids) {
+          await consoleApi(live, 'POST', '/api/profiles/' + encodeURIComponent(id) + '/stop', {}, 15000);
+        }
+      } else {
+        await launcher.reattach();
+        ids = await launcher.stopAll();
+      }
       await emit({ ok: true, stopped: ids }, ids.length ? '已关闭：' + ids.join(', ') : '没有运行中的环境');
       break;
     }

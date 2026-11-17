@@ -1,17 +1,22 @@
 'use strict';
 
-let state = { profiles: [], browserPath: '', timezones: {}, webglPool: [], screenPool: [] };
+let state = { profiles: [], browserPath: '', timezones: {}, presets: [], webglPool: [], screenPool: [] };
 let editingId = null;
+let lastAutoAvail = 1040;
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) =>
   String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 async function api(path, opts = {}) {
+  const method = (opts.method || 'GET').toUpperCase();
+  const needJsonBody = method === 'POST' || method === 'PUT';
+  const body = opts.body !== undefined ? JSON.stringify(opts.body) : needJsonBody ? '{}' : undefined;
   const res = await fetch(path, {
-    headers: { 'content-type': 'application/json' },
     ...opts,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    method,
+    headers: { 'content-type': 'application/json', ...(opts.headers || {}) },
+    body,
   });
   let data = null;
   try {
@@ -126,6 +131,19 @@ function renderGroupFilter() {
   filterGroup = sel.value;
 }
 
+function renderPresetSelect() {
+  const sel = $('#presetSelect');
+  if (!sel) return;
+  const cur = sel.value;
+  const presets = state.presets || [];
+  sel.innerHTML =
+    '<option value="">自定义</option>' +
+    presets
+      .map((p) => '<option value="' + esc(p.key) + '">' + esc(p.label + ' (' + p.key + ' · ' + p.timezone + ')') + '</option>')
+      .join('');
+  sel.value = presets.some((p) => p.key === cur) ? cur : '';
+}
+
 let renderedJson = '';
 
 async function load(force) {
@@ -137,6 +155,7 @@ async function load(force) {
     if (force || json !== renderedJson) {
       renderedJson = json;
       renderGroupFilter();
+      if (!$('#editor').open) renderPresetSelect();
       render();
     }
   } catch (e) {
@@ -169,6 +188,9 @@ function openEditor(profile) {
   const pwInput = $('#editorForm').querySelector('[name="proxyPassword"]');
   pwInput.value = '';
   pwInput.placeholder = '';
+  renderPresetSelect();
+  if ($('#presetSelect')) $('#presetSelect').value = '';
+  if ($('#proxyQuick')) $('#proxyQuick').value = '';
 
   if (profile) {
     const s = profile.screen || {};
@@ -235,6 +257,7 @@ function openEditor(profile) {
     setVal('proxyUsername', '');
     setVal('proxyPassword', '');
   }
+  lastAutoAvail = (Number(getVal('screenHeight')) || 1080) - (getVal('platform') === 'mac' ? 25 : 40);
   syncUaWrap();
   $('#editor').showModal();
 }
@@ -295,6 +318,14 @@ async function saveEditor() {
   if (!data.name) {
     $('#editorErr').textContent = '请填名称';
     return;
+  }
+  if (data.screen.width <= 0 || data.screen.height <= 0 || data.screen.availHeight <= 0) {
+    $('#editorErr').textContent = '屏幕宽高和可用高必须大于 0';
+    return;
+  }
+  if (data.screen.availHeight > data.screen.height || data.screen.height - data.screen.availHeight > 160) {
+    const bar = data.platform === 'mac' ? 25 : 40;
+    data.screen.availHeight = Math.max(200, data.screen.height - bar);
   }
   if (data.proxy.type !== 'none' && (!data.proxy.host || !data.proxy.port)) {
     $('#editorErr').textContent = '选了代理就要填主机和端口';
@@ -531,27 +562,118 @@ $('#btnQuit').addEventListener('click', async () => {
     '控制台已退出。重新打开程序即可继续。</div>';
 });
 
+function applyHardwareRandom(r) {
+  setVal('screenWidth', r.screen.width);
+  setVal('screenHeight', r.screen.height);
+  setVal('screenAvailHeight', r.screen.availHeight);
+  lastAutoAvail = r.screen.availHeight;
+  setVal('pixelRatio', r.screen.pixelRatio);
+  setVal('colorDepth', r.screen.colorDepth);
+  setVal('hardwareConcurrency', r.hardwareConcurrency);
+  setVal('deviceMemory', r.deviceMemory);
+  setVal('webglVendor', r.webglVendor);
+  setVal('webglRenderer', r.webglRenderer);
+}
+
 $('#btnRandom').addEventListener('click', async () => {
   try {
-    const r = await api('/api/random', { method: 'POST', body: {} });
+    const r = await api('/api/random', {
+      method: 'POST',
+      body: {
+        platform: getVal('platform'),
+        locale: getVal('locale').trim(),
+        timezone: getVal('timezone').trim(),
+      },
+    });
     setVal('platform', r.platform);
     setVal('timezone', r.timezone);
     setVal('languages', r.languages.join(','));
     setVal('locale', r.locale);
-    setVal('screenWidth', r.screen.width);
-    setVal('screenHeight', r.screen.height);
-    setVal('screenAvailHeight', r.screen.availHeight);
-    setVal('pixelRatio', r.screen.pixelRatio);
-    setVal('colorDepth', r.screen.colorDepth);
-    setVal('hardwareConcurrency', r.hardwareConcurrency);
-    setVal('deviceMemory', r.deviceMemory);
-    setVal('webglVendor', r.webglVendor);
-    setVal('webglRenderer', r.webglRenderer);
+    applyHardwareRandom(r);
     toast('已随机一套指纹');
   } catch (e) {
     toast(e.message, true);
   }
 });
+
+$('#presetSelect').addEventListener('change', async (e) => {
+  const key = e.target.value;
+  if (!key) return;
+  const p = (state.presets || []).find((x) => x.key === key);
+  if (!p) return;
+  setVal('platform', p.platform);
+  setVal('timezone', p.timezone);
+  setVal('locale', p.locale);
+  setVal('languages', (p.languages || []).join(','));
+  if (!getVal('group').trim()) setVal('group', p.label);
+  try {
+    const r = await api('/api/random', {
+      method: 'POST',
+      body: { platform: p.platform, locale: p.locale, timezone: p.timezone },
+    });
+    applyHardwareRandom(r);
+    toast('已套用预设：' + p.label);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$('#editorForm').querySelector('[name="platform"]').addEventListener('change', async () => {
+  try {
+    const r = await api('/api/random', {
+      method: 'POST',
+      body: {
+        platform: getVal('platform'),
+        locale: getVal('locale').trim(),
+        timezone: getVal('timezone').trim(),
+      },
+    });
+    setVal('screenWidth', r.screen.width);
+    setVal('screenHeight', r.screen.height);
+    setVal('screenAvailHeight', r.screen.availHeight);
+    lastAutoAvail = r.screen.availHeight;
+    setVal('pixelRatio', r.screen.pixelRatio);
+    setVal('colorDepth', r.screen.colorDepth);
+    setVal('webglVendor', r.webglVendor);
+    setVal('webglRenderer', r.webglRenderer);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$('#editorForm').querySelector('[name="screenHeight"]').addEventListener('change', () => {
+  const h = Number(getVal('screenHeight'));
+  if (!h || h <= 200) return;
+  const avail = Number(getVal('screenAvailHeight'));
+  const bar = getVal('platform') === 'mac' ? 25 : 40;
+  if (!avail || avail > h || h - avail > 160 || Math.abs(lastAutoAvail - avail) <= 5) {
+    const nextAvail = Math.max(200, h - bar);
+    setVal('screenAvailHeight', nextAvail);
+    lastAutoAvail = nextAvail;
+  }
+});
+
+async function parseQuickProxy() {
+  const input = $('#proxyQuick');
+  const line = input.value.trim();
+  if (!line) return;
+  try {
+    const px = await api('/api/parse-proxy', { method: 'POST', body: { line } });
+    setVal('proxyType', px.type || 'http');
+    setVal('proxyHost', px.host || '');
+    setVal('proxyPort', px.port || '');
+    setVal('proxyUsername', px.username || '');
+    setVal('proxyPassword', px.password || '');
+    input.value = '';
+    $('#editorErr').textContent = '';
+    toast('已识别代理配置');
+  } catch (err) {
+    $('#editorErr').textContent = err.message;
+  }
+}
+
+$('#proxyQuick').addEventListener('change', parseQuickProxy);
+$('#proxyQuick').addEventListener('paste', () => setTimeout(parseQuickProxy, 0));
 
 (async function init() {
   await load();

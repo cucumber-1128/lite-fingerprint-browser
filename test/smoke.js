@@ -9,12 +9,14 @@ const http = require('node:http');
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
+const { execFileSync, spawnSync } = require('node:child_process');
 
 // 测试不碰生产数据：整个 data 目录指到临时目录
 process.env.FB_DATA = process.env.FB_DATA || path.join(os.tmpdir(), 'fb-smoke-' + process.pid);
 
 const store = require('../src/store');
 const launcher = require('../src/launch');
+const { CDP } = require('../src/cdp');
 const { createRelay } = require('../src/proxy');
 const { findBrowser } = require('../src/browser');
 
@@ -132,6 +134,18 @@ function staticChecks() {
   const px3 = cliutil.parseProxyLine('1.2.3.4:8080:user:pass');
   ok(px3 && px3.username === 'user' && px3.password === 'pass', '代理串解析：host:port:user:pass');
   ok(cliutil.parseProxies('# 注释\nhttp://a.b:1\n\n1.2.3.4:80').length === 2, '代理文件：忽略注释和空行');
+
+  const linuxFp = store.randomFingerprint('linux');
+  ok(
+    !/Direct3D|D3D11/i.test(linuxFp.webglRenderer) && /OpenGL|Mesa/i.test(linuxFp.webglRenderer),
+    'Linux 平台随机出 OpenGL/Mesa 渲染器（不出 D3D11）',
+    linuxFp.webglRenderer
+  );
+  eq(
+    store.normalizeScreen({ width: 1920, height: 1080, availHeight: 728 }, 'win').availHeight,
+    1040,
+    'normalizeScreen 自动修复异常小的 availHeight'
+  );
 }
 
 /* ---------------------------- 2. 代理中继自检 ---------------------------- */
@@ -461,6 +475,72 @@ async function browserChecks() {
     ok(typeof ra.canvasHash === 'number' && ra.canvasHash !== 0, 'Canvas 指纹可读（' + ra.canvasHash + '）');
     ok(typeof ra.audioHash === 'number' && ra.audioHash > 0, 'Audio 指纹可读（' + ra.audioHash + '）');
 
+    // 深度反检测审计：原型链无痕 + Web Worker + OffscreenCanvas + UA-CH + 语音 + matchMedia
+    const auditRaw = await launcher.evaluateInProbePage(
+      a.id,
+      `(async () => {
+        const hcDesc = Object.getOwnPropertyDescriptor(Navigator.prototype, 'hardwareConcurrency');
+        const tw = document.createElement('canvas').getContext('2d').measureText('abc');
+        const worker = await new Promise((resolve) => {
+          const code = [
+            'const res = { hardwareConcurrency: navigator.hardwareConcurrency, deviceMemory: navigator.deviceMemory, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };',
+            'try { const oc = new OffscreenCanvas(32, 32); const gl = oc.getContext("webgl"); const ext = gl.getExtension("WEBGL_debug_renderer_info"); res.webglVendor = ext ? gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) : null; res.webglRenderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : null; } catch (e) { res.glErr = String(e); }',
+            'postMessage(res);'
+          ].join('\\n');
+          const w = new Worker(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
+          const t = setTimeout(() => resolve({ timeout: true }), 4000);
+          w.onmessage = (e) => { clearTimeout(t); w.terminate(); resolve(e.data); };
+          w.onerror = (e) => { clearTimeout(t); resolve({ err: e.message }); };
+        });
+        const uaCh = navigator.userAgentData
+          ? await navigator.userAgentData.getHighEntropyValues(['brands', 'fullVersionList'])
+          : null;
+        let voices = speechSynthesis.getVoices();
+        if (!voices.length) {
+          await new Promise((r) => setTimeout(r, 400));
+          voices = speechSynthesis.getVoices();
+        }
+        return JSON.stringify({
+          hcGetterHasProto: hcDesc && hcDesc.get ? ('prototype' in hcDesc.get) : null,
+          hcGetterName: hcDesc && hcDesc.get ? hcDesc.get.name : null,
+          toDataURLHasProto: 'prototype' in HTMLCanvasElement.prototype.toDataURL,
+          getImageDataLen: CanvasRenderingContext2D.prototype.getImageData.length,
+          fnToStringHasProto: 'prototype' in Function.prototype.toString,
+          textMetricsOwnProps: Object.getOwnPropertyNames(tw),
+          worker,
+          uaChBrandsLen: uaCh && uaCh.brands ? uaCh.brands.length : 0,
+          uaChFullLen: uaCh && uaCh.fullVersionList ? uaCh.fullVersionList.length : 0,
+          speechLeakCn: voices.some((v) => /Chinese \\(Simplified|Huihui|Kangkang|Yaoyao/i.test(String(v.name))),
+          speechAllInstance: voices.every((v) => v instanceof SpeechSynthesisVoice),
+          matchDeviceWidth: matchMedia('(device-width: 2560px)').matches
+        });
+      })()`
+    );
+    const audit = JSON.parse(auditRaw);
+    eq(audit.hcGetterHasProto, false, '原型链 getter 无 prototype 属性（不可构造）');
+    eq(audit.hcGetterName, 'get hardwareConcurrency', '原型链 getter .name 为 get hardwareConcurrency');
+    eq(audit.toDataURLHasProto, false, '覆写方法 toDataURL 无 prototype 属性');
+    eq(audit.getImageDataLen, 4, '覆写方法 getImageData.length 与原生一致（4）');
+    eq(audit.fnToStringHasProto, false, 'Function.prototype.toString 无 prototype 属性');
+    eq(audit.textMetricsOwnProps.length, 0, 'TextMetrics 实例无多余自有属性');
+    eq(audit.worker.hardwareConcurrency, 12, 'Web Worker 内 hardwareConcurrency 与主线程一致（12）');
+    eq(audit.worker.deviceMemory, 8, 'Web Worker 内 deviceMemory 与主线程一致（8）');
+    eq(audit.worker.timezone, 'America/New_York', 'Web Worker 内时区与主线程一致');
+    eq(audit.worker.webglVendor, 'Google Inc. (AMD)', 'Worker OffscreenCanvas WebGL 厂商一致');
+    ok(
+      String(audit.worker.webglRenderer || '').includes('Radeon RX 6600'),
+      'Worker OffscreenCanvas WebGL 渲染器一致',
+      audit.worker
+    );
+    ok(
+      audit.uaChBrandsLen >= 3 && audit.uaChBrandsLen === audit.uaChFullLen,
+      'UA-CH brands 与 fullVersionList 长度一致（' + audit.uaChBrandsLen + '）',
+      audit
+    );
+    eq(audit.speechLeakCn, false, 'Windows en-US 环境 speechSynthesis 不泄露中文 SAPI 语音');
+    eq(audit.speechAllInstance, true, 'speechSynthesis 语音对象保持 SpeechSynthesisVoice 实例');
+    eq(audit.matchDeviceWidth, true, 'matchMedia(device-width: 2560px) 与伪装屏幕一致');
+
     // 第二个环境：指纹必须完全不同
     t0 = Date.now();
     await launcher.launch(b.id);
@@ -594,6 +674,135 @@ async function headerChecks() {
   }
 }
 
+/* ------------------ 5. CLI 守护进程与新标签页持久性验证 ------------------ */
+
+async function cliDaemonChecks() {
+  console.log('\n[5] CLI 守护进程与新标签页持久性验证');
+  const indexJs = path.resolve(__dirname, '..', 'src', 'index.js');
+  const cliData = path.join(os.tmpdir(), 'fb-cli-smoke-' + process.pid);
+  const env = { ...process.env, FB_DATA: cliData };
+  let id = null;
+
+  const srv = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end('<!doctype html><meta charset="utf-8"><title>cli new tab</title><body>ok</body>');
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const testUrl = 'http://127.0.0.1:' + srv.address().port + '/';
+
+  try {
+    const helpRes = spawnSync(process.execPath, [indexJs, 'create', '--help'], {
+      env,
+      encoding: 'utf8',
+      timeout: 10000,
+    });
+    eq(helpRes.status, 0, 'create --help 退出码为 0');
+    ok((helpRes.stdout || '').includes('CLI'), 'create --help 输出帮助文本而不启动控制台');
+    ok(!fs.existsSync(path.join(cliData, 'profiles.json')), 'create --help 不会误创建环境数据');
+
+    const created = JSON.parse(
+      execFileSync(process.execPath, [indexJs, 'create', '--preset', 'us-west', '--name', 'cli测试', '--json'], {
+        env,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
+    );
+    id = created.created && created.created[0] && created.created[0].id;
+    const expectGpu = created.created && created.created[0] && created.created[0].webglRenderer;
+    const expectHc = created.created && created.created[0] && created.created[0].hardwareConcurrency;
+    ok(!!id, 'CLI create --preset us-west 成功（' + id + '）');
+
+    const launched = JSON.parse(
+      execFileSync(process.execPath, [indexJs, 'launch', id, '--json'], {
+        env,
+        encoding: 'utf8',
+        timeout: 45000,
+      })
+    );
+    const port = launched.results && launched.results[0] && launched.results[0].port;
+    ok(launched.ok === true && !!port, 'CLI launch 返回成功并带回调试端口 ' + port);
+
+    // launch 进程已退出后，新建标签页仍须由后台守护进程持续维持完整伪装
+    const verRes = await fetch('http://127.0.0.1:' + port + '/json/version');
+    const { webSocketDebuggerUrl } = await verRes.json();
+    const cdp = await CDP.connect(webSocketDebuggerUrl, 8000);
+    let newTid = null;
+    try {
+      const createdTab = await cdp.send('Target.createTarget', { url: 'about:blank' });
+      newTid = createdTab.targetId;
+      const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: newTid, flatten: true });
+      await cdp.try_('Page.enable', {}, sessionId);
+
+      // 给 daemon 的 autoAttach 事件留一点处理间隙，然后导航到真实本地页面
+      await sleep(300);
+      let loaded = false;
+      const onLoad = (params, sid) => {
+        if (sid === sessionId) loaded = true;
+      };
+      cdp.on('Page.loadEventFired', onLoad);
+      await cdp.send('Page.navigate', { url: testUrl }, sessionId);
+      const t0 = Date.now();
+      while (!loaded && Date.now() - t0 < 8000) await sleep(50);
+      cdp.removeListener('Page.loadEventFired', onLoad);
+
+      const ev = await cdp.send(
+        'Runtime.evaluate',
+        {
+          expression: `(() => {
+            const gl = document.createElement('canvas').getContext('webgl');
+            const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+            return JSON.stringify({
+              tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+              hc: navigator.hardwareConcurrency,
+              gpu: ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : null
+            });
+          })()`,
+          returnByValue: true,
+        },
+        sessionId
+      );
+      const tabVal = JSON.parse(ev.result.value);
+      eq(tabVal.tz, 'America/Los_Angeles', 'CLI launch 退出后新开标签页仍保持 America/Los_Angeles 时区');
+      eq(tabVal.hc, expectHc, 'CLI launch 退出后新开标签页仍保持配置的 CPU 核数');
+      eq(tabVal.gpu, expectGpu, 'CLI launch 退出后新开标签页仍保持伪装 WebGL 渲染器');
+    } finally {
+      if (newTid) await cdp.try_('Target.closeTarget', { targetId: newTid });
+      cdp.close();
+    }
+
+    const stopped = JSON.parse(
+      execFileSync(process.execPath, [indexJs, 'stop', id, '--json'], {
+        env,
+        encoding: 'utf8',
+        timeout: 20000,
+      })
+    );
+    eq(stopped.ok, true, 'CLI stop 成功关闭守护进程托管的环境');
+  } catch (e) {
+    ok(false, 'CLI 守护进程测试异常: ' + (e && e.message ? e.message : e));
+  } finally {
+    try {
+      const cinfo = JSON.parse(fs.readFileSync(path.join(cliData, 'console.json'), 'utf8'));
+      if (cinfo && cinfo.port) {
+        await fetch('http://127.0.0.1:' + cinfo.port + '/api/shutdown', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        }).catch(() => {});
+        await sleep(350);
+      }
+    } catch {
+      /* ignore */
+    }
+    srv.close();
+    try {
+      fs.rmSync(cliData, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 /* ------------------------------- 跑起来 ------------------------------- */
 
 (async () => {
@@ -603,6 +812,7 @@ async function headerChecks() {
   await testSocks5Relay();
   await browserChecks();
   await headerChecks();
+  await cliDaemonChecks();
 
   console.log('\n' + '─'.repeat(58));
   if (failures.length) {

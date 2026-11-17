@@ -55,6 +55,12 @@
       <button type="button" class="btn tiny" id="btnRandom">随机一套</button>
     </h3>
 
+    <label class="full">地区预设（可选，一键对齐平台 / 时区 / 语言 / 显卡）
+      <select name="presetKey" id="presetSelect">
+        <option value="">自定义</option>
+      </select>
+    </label>
+
     <div class="row">
       <label>系统平台
         <select name="platform">
@@ -126,6 +132,9 @@
     </div>
 
     <h3>代理</h3>
+    <label class="full">一键识别代理串（可选，粘贴后自动拆分）
+      <input id="proxyQuick" placeholder="如 socks5://user:pass@1.2.3.4:1080 或 host:port:user:pass" autocomplete="off" />
+    </label>
     <div class="row">
       <label>类型
         <select name="proxyType">

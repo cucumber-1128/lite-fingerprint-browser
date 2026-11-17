@@ -10,6 +10,7 @@ const launcher = require('./launch');
 const runtime = require('./runtime');
 const { testProxy } = require('./proxy');
 const { findBrowser } = require('./browser');
+const { PRESETS, parseProxyLine } = require('./cliutil');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -78,7 +79,7 @@ function withRunning(profile) {
   return { ...store.publicProfile(profile), running: !!info, instance: info };
 }
 
-function createServer() {
+function createServer(opts = {}) {
   const server = http.createServer(async (req, res) => {
     const method = req.method || 'GET';
     const boundPort = server.address() ? server.address().port : 0;
@@ -91,7 +92,7 @@ function createServer() {
       return json(res, 403, { error: '只允许通过 127.0.0.1 访问控制台' });
     }
 
-    // 写操作校验 Origin：挡住跨站表单 / fetch / sendBeacon（CSRF）
+    // 写操作校验 Origin 与 Sec-Fetch-Site：挡住跨站表单 / fetch / sendBeacon（CSRF）
     if (method !== 'GET' && method !== 'HEAD') {
       const origin = req.headers.origin;
       if (origin) {
@@ -103,6 +104,10 @@ function createServer() {
         }
         if (!sameHost) return json(res, 403, { error: '跨站请求被拒绝' });
       }
+      const sfs = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+      if (sfs && sfs !== 'same-origin' && sfs !== 'none') {
+        return json(res, 403, { error: '跨站请求被拒绝' });
+      }
     }
 
     const url = new URL(req.url, 'http://127.0.0.1');
@@ -111,6 +116,12 @@ function createServer() {
     try {
       /* ------------------------------- API ------------------------------- */
       if (pathname.startsWith('/api/')) {
+        if (method === 'POST' || method === 'PUT') {
+          const ct = String(req.headers['content-type'] || '').toLowerCase();
+          if (!ct.startsWith('application/json')) {
+            return json(res, 415, { error: '需要 application/json 请求头' });
+          }
+        }
         const parts = pathname.split('/').filter(Boolean); // ['api', ...]
         const seg = parts.slice(1);
 
@@ -121,7 +132,10 @@ function createServer() {
             running: launcher.listRunning(),
             browserPath: browser,
             timezones: store.TIMEZONES,
+            presets: Object.entries(PRESETS).map(([key, p]) => ({ key, ...p })),
             webglPool: store.WEBGL_POOL,
+            webglMac: store.WEBGL_MAC,
+            webglLinux: store.WEBGL_LINUX,
             screenPool: store.SCREEN_POOL,
           });
         }
@@ -142,7 +156,22 @@ function createServer() {
 
         if (method === 'POST' && pathname === '/api/random') {
           const body = await readBody(req);
-          return json(res, 200, store.randomFingerprint(body.platform));
+          return json(
+            res,
+            200,
+            store.randomFingerprint(body.platform, { locale: body.locale, timezone: body.timezone })
+          );
+        }
+
+        if (method === 'POST' && pathname === '/api/parse-proxy') {
+          const body = await readBody(req);
+          try {
+            const parsed = parseProxyLine(body.line || '');
+            if (!parsed) return json(res, 400, { error: '代理串为空' });
+            return json(res, 200, parsed);
+          } catch (e) {
+            return json(res, 400, { error: e && e.message ? e.message : String(e) });
+          }
         }
 
         if (method === 'POST' && pathname === '/api/shutdown') {
@@ -265,6 +294,9 @@ function createServer() {
       if (method !== 'GET') {
         res.writeHead(405).end('method not allowed');
         return;
+      }
+      if ((pathname === '/' || pathname === '/index.html') && typeof opts.onUiVisit === 'function') {
+        opts.onUiVisit();
       }
       serveStatic(req, res, pathname);
     } catch (e) {

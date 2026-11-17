@@ -157,7 +157,7 @@ const UA_CH_EXPR = `(async () => {
   if (!navigator.userAgentData) return '{}';
   try {
     return JSON.stringify(await navigator.userAgentData.getHighEntropyValues(
-      ['platform', 'platformVersion', 'architecture', 'bitness', 'model', 'uaFullVersion', 'wow64']
+      ['platform', 'platformVersion', 'architecture', 'bitness', 'model', 'uaFullVersion', 'wow64', 'fullVersionList']
     ));
   } catch (e) {
     return '{}';
@@ -220,6 +220,7 @@ async function fetchRealHints(cdp) {
       model: high.model || '',
       wow64: high.wow64 === true,
       fullVersion: high.uaFullVersion || '',
+      fullVersionList: Array.isArray(high.fullVersionList) ? high.fullVersionList : [],
     };
   } finally {
     if (targetId) {
@@ -304,10 +305,14 @@ function buildUaMetadata(profile, fullVersion, hints) {
         { brand: 'Google Chrome', version: major },
       ];
 
-  // fullVersionList：真机只列真品牌（不含 GREASE），版本用完整版本号
-  const fullVersionList = brands
-    .filter((b) => !/not.?a.?brand/i.test(String(b.brand)))
-    .map((b) => ({ brand: b.brand, version: full }));
+  // fullVersionList：与 brands 保持等长（包含 GREASE 项，否则长度对不上）
+  const fullVersionList = brands.map((b) => {
+    if (/not.?a.?brand/i.test(String(b.brand))) {
+      const gv = String(b.version || '99');
+      return { brand: b.brand, version: gv.includes('.') ? gv : gv + '.0.0.0' };
+    }
+    return { brand: b.brand, version: full };
+  });
 
   return {
     brands,
@@ -332,21 +337,18 @@ function deriveFakeIp(seed) {
 /** 组装注入脚本用的配置（probe 的期望值也用它，避免两处各算一套） */
 function buildConfig(profile) {
   const REAL_PLATFORM = { win32: 'win', darwin: 'mac', linux: 'linux' }[process.platform] || 'linux';
+  const platform = profile.platform || 'win';
+  const scr = store.normalizeScreen(profile.screen || {}, platform);
   return {
     seed: profile.seed || 'seed',
-    platform: profile.platform || 'win',
+    platform,
     realPlatform: REAL_PLATFORM,
+    locale: profile.locale || 'zh-CN',
     hardwareConcurrency: Number(profile.hardwareConcurrency) || 8,
     // 规范上限就是 8：真 Chrome 永远不会报 16，报 16 等于自曝
     deviceMemory: Math.min(8, Math.max(1, Number(profile.deviceMemory) || 8)),
     maxTouchPoints: Number(profile.maxTouchPoints) || 0,
-    screen: {
-      width: Number(profile.screen && profile.screen.width) || 1920,
-      height: Number(profile.screen && profile.screen.height) || 1080,
-      availHeight: Number(profile.screen && profile.screen.availHeight) || 1040,
-      colorDepth: Number(profile.screen && profile.screen.colorDepth) || 24,
-      pixelRatio: Number(profile.screen && profile.screen.pixelRatio) || 1,
-    },
+    screen: scr,
     webglVendor: profile.webglVendor || 'Google Inc. (NVIDIA)',
     webglRenderer:
       profile.webglRenderer ||
@@ -355,7 +357,7 @@ function buildConfig(profile) {
     audioNoise: profile.audioNoise !== false,
     textNoise: profile.textNoise !== false,
     fontNoise: profile.fontNoise !== false,
-    fontWhitelist: FONT_POOL[profile.platform] || FONT_POOL.win,
+    fontWhitelist: FONT_POOL[platform] || FONT_POOL.win,
     rectNoise: profile.rectNoise === true,
     webrtc: profile.webrtc || 'proxy',
     fakeIp: deriveFakeIp(profile.seed || 'seed'),
@@ -439,7 +441,26 @@ async function waitForDevTools(userDataDir, proc, timeoutMs = 25000, knownPort =
 function makeSessionPatcher(cdp, ctx) {
   return async function applySession(sessionId, targetInfo) {
     const type = targetInfo && targetInfo.type;
-    if (type !== 'page' && type !== 'iframe') return;
+    const tid = targetInfo && targetInfo.targetId;
+    const isWorker = type === 'worker' || type === 'shared_worker' || type === 'service_worker';
+    if (type !== 'page' && type !== 'iframe' && !isWorker) return;
+
+    if (isWorker) {
+      await cdp.try_('Emulation.setUserAgentOverride', ctx.uaOverride, sessionId);
+      await cdp.try_('Emulation.setTimezoneOverride', { timezoneId: ctx.timezone }, sessionId);
+      await cdp.try_('Emulation.setLocaleOverride', { locale: ctx.locale }, sessionId);
+      if (tid && !ctx.scripted.has(tid)) {
+        const r = await cdp.try_('Runtime.evaluate', { expression: ctx.script }, sessionId);
+        if (r !== null) ctx.scripted.add(tid);
+      }
+      await cdp.try_(
+        'Target.setAutoAttach',
+        { autoAttach: true, waitForDebuggerOnStart: true, flatten: true },
+        sessionId
+      );
+      return;
+    }
+
     await cdp.try_('Page.enable', {}, sessionId);
     await cdp.try_('Emulation.setUserAgentOverride', ctx.uaOverride, sessionId);
     await cdp.try_('Emulation.setTimezoneOverride', { timezoneId: ctx.timezone }, sessionId);
@@ -447,7 +468,6 @@ function makeSessionPatcher(cdp, ctx) {
     // 同一个 target 只挂一次注入脚本。
     // 幂等放在 Node 侧（而不是在页面里留一个 symbol 标记）——页面里任何标记
     // 都能被 Object.getOwnPropertySymbols(window) 一行枚举出来，等于自曝。
-    const tid = targetInfo && targetInfo.targetId;
     if (tid && !ctx.scripted.has(tid)) {
       const r = await cdp.try_(
         'Page.addScriptToEvaluateOnNewDocument',
@@ -458,13 +478,13 @@ function makeSessionPatcher(cdp, ctx) {
     }
     if (type === 'page') {
       await cdp.try_('Emulation.setFocusEmulationEnabled', { enabled: true }, sessionId);
-      // 页面里的跨域 iframe 是独立 target，也要挂上自动接管
-      await cdp.try_(
-        'Target.setAutoAttach',
-        { autoAttach: true, waitForDebuggerOnStart: true, flatten: true },
-        sessionId
-      );
     }
+    // 页面和跨域 iframe 里都可能继续创建子 iframe 或 Worker，统一挂上自动接管
+    await cdp.try_(
+      'Target.setAutoAttach',
+      { autoAttach: true, waitForDebuggerOnStart: true, flatten: true },
+      sessionId
+    );
   };
 }
 
@@ -556,17 +576,23 @@ function wireTargetHandlers(cdp, instance, applySession) {
   });
 }
 
-/** 接管已经存在的页面，返回主页面 session */
+/** 接管已经存在的页面和 Worker，返回主页面 session */
 async function attachExistingPages(cdp, instance, applySession) {
   const { targetInfos } = await cdp.send('Target.getTargets');
-  const pages = targetInfos.filter((t) => t.type === 'page');
+  const targets = targetInfos.filter(
+    (t) =>
+      t.type === 'page' ||
+      t.type === 'worker' ||
+      t.type === 'shared_worker' ||
+      t.type === 'service_worker'
+  );
   let mainSession = null;
-  for (const t of pages) {
+  for (const t of targets) {
     try {
       const r = await cdp.send('Target.attachToTarget', { targetId: t.targetId, flatten: true });
       instance.sessions.set(t.targetId, r.sessionId);
       await applySession(r.sessionId, t);
-      if (!mainSession) mainSession = r.sessionId;
+      if (!mainSession && t.type === 'page') mainSession = r.sessionId;
     } catch {
       /* ignore */
     }
@@ -755,9 +781,9 @@ async function launch(profileId, options = {}) {
     /* ignore */
   }
 
-  const S = profile.screen || {};
-  const screenW = Number(S.width) || 1920;
-  const screenH = Number(S.height) || 1080;
+  const S = store.normalizeScreen(profile.screen || {}, profile.platform || 'win');
+  const screenW = S.width;
+  const screenH = S.height;
 
   /* 1. 代理中继 */
   let relay = null;
@@ -776,6 +802,11 @@ async function launch(profileId, options = {}) {
   // 固定端口。写 0 的话 Chrome 会打开 AutomationControlled，navigator.webdriver 变成 true
   const debugPort = await freePort();
 
+  // 按环境 seed 生成轻微窗口偏移，避免多开窗口全部堆在 (0,0) 重叠或 screenX/Y 恒为 0
+  const posHash = crypto.createHash('sha256').update(String(profile.seed || profileId)).digest();
+  const posX = 24 + (posHash[2] % 96);
+  const posY = 20 + (posHash[3] % 64);
+
   /* 2. 组装参数 */
   const args = [
     '--user-data-dir=' + userDataDir,
@@ -790,17 +821,38 @@ async function launch(profileId, options = {}) {
     '--disable-session-crashed-bubble',
     '--hide-crash-restore-bubble',
     '--window-size=' + Math.round(screenW * 0.86) + ',' + Math.round(screenH * 0.86),
-    '--window-position=0,0',
+    '--window-position=' + posX + ',' + posY,
     '--lang=' + (profile.languages && profile.languages[0] ? profile.languages[0] : 'zh-CN'),
   ];
   if (relay) {
     args.push('--proxy-server=http://127.0.0.1:' + relay.port);
+  }
+  if (relay || (profile.webrtc || 'proxy') !== 'real') {
     // 禁止 WebRTC 走非代理的 UDP，避免真实 IP 泄露
     args.push('--force-webrtc-ip-handling-policy=disable_non_proxied_udp');
+  }
+  if (profile.webrtc === 'disabled') {
+    args.push('--enforce-webrtc-ip-permission-check');
   }
   args.push('about:blank');
 
   /* 3. 启动 */
+  try {
+    const st = fs.statSync(logPath);
+    if (st.size > 2 * 1024 * 1024) {
+      const fd = fs.openSync(logPath, 'r');
+      try {
+        const keep = 256 * 1024;
+        const buf = Buffer.alloc(keep);
+        const readBytes = fs.readSync(fd, buf, 0, keep, st.size - keep);
+        fs.writeFileSync(logPath, buf.subarray(0, readBytes));
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+  } catch {
+    /* 日志不存在或截断失败不影响启动 */
+  }
   const logFd = fs.openSync(logPath, 'a');
   const proc = spawn(chromePath, args, {
     stdio: ['ignore', 'ignore', logFd],

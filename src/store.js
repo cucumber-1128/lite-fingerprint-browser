@@ -47,6 +47,14 @@ const WEBGL_MAC = [
   ['Google Inc. (Intel)', 'ANGLE (Intel, Intel(R) Iris(TM) Plus Graphics, OpenGL 4.1)'],
 ];
 
+// Linux 走 Mesa / OpenGL，不能随机出 Windows 专属的 Direct3D11
+const WEBGL_LINUX = [
+  ['Google Inc. (Intel)', 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)'],
+  ['Google Inc. (Intel)', 'ANGLE (Intel, Mesa Intel(R) Iris(R) Xe Graphics (ADL GT2), OpenGL 4.6)'],
+  ['Google Inc. (AMD)', 'ANGLE (AMD, AMD Radeon RX 6600 (navi23, LLVM 15.0.7, DRM 3.49, 6.5.0-generic), OpenGL 4.6)'],
+  ['Google Inc. (NVIDIA)', 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060/PCIe/SSE2, OpenGL 4.5.0)'],
+];
+
 const SCREEN_POOL = [
   { width: 1920, height: 1080, colorDepth: 24, pixelRatio: 1 },
   { width: 2560, height: 1440, colorDepth: 24, pixelRatio: 1 },
@@ -54,6 +62,12 @@ const SCREEN_POOL = [
   { width: 1440, height: 900, colorDepth: 24, pixelRatio: 1 },
   { width: 1366, height: 768, colorDepth: 24, pixelRatio: 1 },
   { width: 1536, height: 864, colorDepth: 24, pixelRatio: 1.25 },
+];
+
+const SCREEN_MAC = [
+  { width: 1728, height: 1117, colorDepth: 30, pixelRatio: 2 },
+  { width: 1512, height: 982, colorDepth: 30, pixelRatio: 2 },
+  { width: 1440, height: 900, colorDepth: 30, pixelRatio: 2 },
 ];
 
 const CPU_POOL = [4, 8, 8, 12, 16];
@@ -125,13 +139,32 @@ function save(db) {
   fs.renameSync(tmp, FILE);
 }
 
+/** 屏幕参数归一化：修正大于屏高或任务栏扣除异常的 availHeight */
+function normalizeScreen(screen, platform) {
+  const plat = platform || 'win';
+  const width = Number(screen && screen.width) || (plat === 'mac' ? 1728 : 1920);
+  const height = Number(screen && screen.height) || (plat === 'mac' ? 1117 : 1080);
+  const bar = plat === 'mac' ? 25 : 40;
+  const rawAvail = Number(screen && screen.availHeight);
+  const availHeight =
+    !isFinite(rawAvail) || rawAvail <= 0 || rawAvail > height || height - rawAvail > 160
+      ? Math.max(200, height - bar)
+      : rawAvail;
+  return {
+    width,
+    height,
+    availHeight,
+    colorDepth: Number(screen && screen.colorDepth) || (plat === 'mac' ? 30 : 24),
+    pixelRatio: Number(screen && screen.pixelRatio) || (plat === 'mac' ? 2 : 1),
+  };
+}
+
 /** 生成一套随机但自洽的指纹 */
-function randomFingerprint(platform) {
+function randomFingerprint(platform, opts = {}) {
   const plat = platform || pick(['win', 'win', 'win', 'mac']);
   // 必须拷贝：下面会按平台改写屏幕，直接改池子里的对象会污染后续所有环境
-  const screen = { ...pick(SCREEN_POOL) };
-  const gl = pick(plat === 'mac' ? WEBGL_MAC : WEBGL_POOL);
-  const locale = plat === 'mac' ? pick(['en-US', 'zh-CN']) : pick(['zh-CN', 'zh-CN', 'en-US']);
+  const screen = { ...pick(plat === 'mac' ? SCREEN_MAC : SCREEN_POOL) };
+  const gl = pick(plat === 'mac' ? WEBGL_MAC : plat === 'linux' ? WEBGL_LINUX : WEBGL_POOL);
   const langMap = {
     'zh-CN': ['zh-CN', 'zh', 'en-US', 'en'],
     'en-US': ['en-US', 'en'],
@@ -140,23 +173,19 @@ function randomFingerprint(platform) {
     'de-DE': ['de-DE', 'de', 'en-US', 'en'],
     'zh-TW': ['zh-TW', 'zh', 'en-US', 'en'],
   };
-  if (plat === 'mac') {
-    screen.width = 1728;
-    screen.height = 1117;
-    screen.pixelRatio = 2;
-  }
+  const locale =
+    opts && opts.locale && langMap[opts.locale]
+      ? opts.locale
+      : plat === 'mac'
+        ? pick(['en-US', 'zh-CN'])
+        : pick(['zh-CN', 'zh-CN', 'en-US']);
+  const timezone = opts && opts.timezone ? opts.timezone : pick(TIMEZONES[locale] || ['Asia/Shanghai']);
   return {
     platform: plat,
     languages: langMap[locale] || langMap['en-US'],
     locale,
-    timezone: pick(TIMEZONES[locale] || ['Asia/Shanghai']),
-    screen: {
-      width: screen.width,
-      height: screen.height,
-      availHeight: screen.height - (plat === 'mac' ? 25 : 40),
-      colorDepth: screen.colorDepth,
-      pixelRatio: screen.pixelRatio,
-    },
+    timezone,
+    screen: normalizeScreen(screen, plat),
     hardwareConcurrency: pick(CPU_POOL),
     deviceMemory: pick(MEM_POOL),
     webglVendor: gl[0],
@@ -215,7 +244,7 @@ function create(input = {}) {
   const p = defaults(input);
   // 允许覆盖任意字段
   for (const [k, v] of Object.entries(input)) {
-    if (k === 'id') continue;
+    if (k === 'id' || v === undefined) continue;
     if (k === 'proxy' && v && typeof v === 'object') {
       const { hasPassword, ...rest } = v; // 只读派生字段，不落库
       p.proxy = { ...p.proxy, ...rest };
@@ -227,6 +256,7 @@ function create(input = {}) {
       p[k] = v;
     }
   }
+  p.screen = normalizeScreen(p.screen, p.platform);
   p.updatedAt = new Date().toISOString();
   db.profiles.push(p);
   save(db);
@@ -239,7 +269,7 @@ function update(id, patch = {}) {
   const p = db.profiles.find((x) => x.id === id);
   if (!p) return null;
   for (const [k, v] of Object.entries(patch)) {
-    if (k === 'id' || k === 'createdAt') continue;
+    if (k === 'id' || k === 'createdAt' || v === undefined) continue;
     if (k === 'proxy' && v && typeof v === 'object') {
       const { hasPassword, ...rest } = v; // 只读派生字段，不落库
       p.proxy = { ...p.proxy, ...rest };
@@ -251,6 +281,7 @@ function update(id, patch = {}) {
       p[k] = v;
     }
   }
+  p.screen = normalizeScreen(p.screen, p.platform);
   p.updatedAt = new Date().toISOString();
   save(db);
   return p;
@@ -340,8 +371,11 @@ module.exports = {
   publicProfile,
   profileDir,
   randomFingerprint,
+  normalizeScreen,
   TIMEZONES,
   WEBGL_POOL,
   WEBGL_MAC,
+  WEBGL_LINUX,
   SCREEN_POOL,
+  SCREEN_MAC,
 };

@@ -1,17 +1,19 @@
 /**
- * 指纹注入脚本（在主世界 document-start 阶段执行）。
+ * 指纹注入脚本（在主世界 document-start 阶段以及 Worker 环境中执行）。
  *
  * 设计原则 —— 只改"真浏览器改不掉"的部分：
  *   UA / UA-CH / 语言 / 时区 / locale 由 CDP 在 Chromium 原生层覆盖（无 JS 痕迹）；
- *   这里只处理 CDP 覆盖不到、或原生层改不动的：CPU 核数、内存、屏幕、Canvas、WebGL、Audio、WebRTC。
+ *   这里只处理 CDP 覆盖不到、或原生层改不动的：CPU 核数、内存、屏幕、Canvas、WebGL、WebGPU、Audio、WebRTC。
  *   本文件被当作纯文本读取，配置占位符会被替换成 JSON 字面量，因此内部不要使用反引号。
  */
 (function () {
   'use strict';
 
   var CFG = __CFG__;
+  var G = typeof globalThis !== 'undefined' ? globalThis : typeof self !== 'undefined' ? self : window;
+  var IS_WINDOW = typeof window !== 'undefined' && typeof document !== 'undefined';
   // 幂等由 Node 侧保证（同一个 target 只挂一次脚本），页面里不留任何标记：
-  // 任何 `window[Symbol.for('fb.'+seed)]` 这种守卫都能被
+  // 任何 window[Symbol.for('fb.'+seed)] 这种守卫都能被
   // Object.getOwnPropertySymbols(window) 一行枚举出来，等于主动告诉站点"我被改过"。
 
   /* --------------------------- 让补丁看起来是原生的 --------------------------- */
@@ -26,10 +28,12 @@
     }
     return fn;
   }
-  var patchedToString = function toString() {
-    var n = maskMap.get(this);
-    return n ? 'function ' + n + '() { [native code] }' : rawToString.call(this);
-  };
+  var patchedToString = ({
+    toString() {
+      var n = maskMap.get(this);
+      return n ? 'function ' + n + '() { [native code] }' : rawToString.call(this);
+    },
+  }).toString;
   mask(patchedToString, 'toString');
   try {
     Function.prototype.toString = patchedToString;
@@ -46,15 +50,74 @@
     return h >>> 0;
   }
 
+  function makeGetter(prop, impl) {
+    var g = Object.getOwnPropertyDescriptor(
+      {
+        get [prop]() {
+          return impl.call(this);
+        },
+      },
+      prop
+    ).get;
+    return mask(g, 'get ' + prop);
+  }
+
+  function makeMethod(name, len, impl) {
+    var o;
+    if (len === 1) {
+      o = {
+        [name](a) {
+          return impl.apply(this, arguments);
+        },
+      };
+    } else if (len === 2) {
+      o = {
+        [name](a, b) {
+          return impl.apply(this, arguments);
+        },
+      };
+    } else if (len === 3) {
+      o = {
+        [name](a, b, c) {
+          return impl.apply(this, arguments);
+        },
+      };
+    } else if (len === 4) {
+      o = {
+        [name](a, b, c, d) {
+          return impl.apply(this, arguments);
+        },
+      };
+    } else {
+      o = {
+        [name]() {
+          return impl.apply(this, arguments);
+        },
+      };
+    }
+    return mask(o[name], name);
+  }
+
   function defineGetters(obj, map) {
+    if (!obj) return;
     for (var prop in map) {
       if (!Object.prototype.hasOwnProperty.call(map, prop)) continue;
       (function (p, v) {
-        var g = mask(function () {
-          return v;
-        }, 'get ' + p);
+        var prev = null;
         try {
-          Object.defineProperty(obj, p, { get: g, configurable: true, enumerable: true });
+          prev = Object.getOwnPropertyDescriptor(obj, p);
+        } catch (e) {
+          /* ignore */
+        }
+        var g = makeGetter(p, function () {
+          return v;
+        });
+        try {
+          Object.defineProperty(obj, p, {
+            get: g,
+            configurable: prev ? prev.configurable : true,
+            enumerable: prev ? prev.enumerable : true,
+          });
         } catch (e) {
           /* ignore */
         }
@@ -66,16 +129,28 @@
 
   // webdriver 不动。启动时用固定调试端口，原生值就是 false。
   // 这里再 defineProperty，iframe 里的 Function#toString 能看到假 getter，Google 登录会拒。
-  defineGetters(Navigator.prototype, {
-    hardwareConcurrency: CFG.hardwareConcurrency,
-    deviceMemory: CFG.deviceMemory,
-    maxTouchPoints: CFG.maxTouchPoints,
-  });
+  if (typeof Navigator !== 'undefined') {
+    defineGetters(Navigator.prototype, {
+      hardwareConcurrency: CFG.hardwareConcurrency,
+      deviceMemory: CFG.deviceMemory,
+      maxTouchPoints: CFG.maxTouchPoints,
+    });
+  }
+  if (typeof WorkerNavigator !== 'undefined') {
+    var workerNavMap = {
+      hardwareConcurrency: CFG.hardwareConcurrency,
+      deviceMemory: CFG.deviceMemory,
+    };
+    if ('maxTouchPoints' in WorkerNavigator.prototype) {
+      workerNavMap.maxTouchPoints = CFG.maxTouchPoints;
+    }
+    defineGetters(WorkerNavigator.prototype, workerNavMap);
+  }
 
   /* ---------------------------------- screen --------------------------------- */
 
   var S = CFG.screen || {};
-  if (S.width) {
+  if (IS_WINDOW && typeof Screen !== 'undefined' && S.width) {
     defineGetters(Screen.prototype, {
       width: S.width,
       height: S.height,
@@ -91,11 +166,76 @@
     defineGetters(window, {
       devicePixelRatio: S.pixelRatio || 1,
     });
+
+    if (typeof window.matchMedia === 'function' && typeof MediaQueryList !== 'undefined') {
+      var mqlOverrides = new WeakMap();
+      var origMatchMedia = window.matchMedia;
+      var mqlDesc = Object.getOwnPropertyDescriptor(MediaQueryList.prototype, 'matches');
+      if (mqlDesc && mqlDesc.get) {
+        var origMqlMatches = mqlDesc.get;
+        try {
+          Object.defineProperty(MediaQueryList.prototype, 'matches', {
+            configurable: mqlDesc.configurable,
+            enumerable: mqlDesc.enumerable,
+            get: makeGetter('matches', function () {
+              if (mqlOverrides.has(this)) return mqlOverrides.get(this);
+              return origMqlMatches.call(this);
+            }),
+          });
+        } catch (e) {
+          /* ignore */
+        }
+      }
+
+      function evalDeviceQuery(q) {
+        var s = String(q || '').trim();
+        var m = /^\(\s*(min-|max-)?device-(width|height)\s*:\s*(\d+(?:\.\d+)?)px\s*\)$/i.exec(s);
+        if (m) {
+          var prefix = m[1] ? m[1].toLowerCase() : '';
+          var actual = m[2].toLowerCase() === 'width' ? S.width : S.height;
+          var target = Number(m[3]);
+          if (prefix === 'min-') return actual >= target;
+          if (prefix === 'max-') return actual <= target;
+          return actual === target;
+        }
+        m = /^\(\s*-webkit-(min-|max-)?device-pixel-ratio\s*:\s*(\d+(?:\.\d+)?)\s*\)$/i.exec(s);
+        if (m) {
+          var dprPrefix = m[1] ? m[1].toLowerCase() : '';
+          var dpr = S.pixelRatio || 1;
+          var targetDpr = Number(m[2]);
+          if (dprPrefix === 'min-') return dpr >= targetDpr;
+          if (dprPrefix === 'max-') return dpr <= targetDpr;
+          return Math.abs(dpr - targetDpr) < 0.001;
+        }
+        m = /^\(\s*(min-|max-)?resolution\s*:\s*(\d+(?:\.\d+)?)(dppx|dpi)\s*\)$/i.exec(s);
+        if (m) {
+          var resPrefix = m[1] ? m[1].toLowerCase() : '';
+          var curDpr = S.pixelRatio || 1;
+          var actualRes = m[3].toLowerCase() === 'dpi' ? curDpr * 96 : curDpr;
+          var targetRes = Number(m[2]);
+          if (resPrefix === 'min-') return actualRes >= targetRes;
+          if (resPrefix === 'max-') return actualRes <= targetRes;
+          return Math.abs(actualRes - targetRes) < 0.01;
+        }
+        return null;
+      }
+
+      window.matchMedia = makeMethod('matchMedia', origMatchMedia.length, function () {
+        var mql = origMatchMedia.apply(this, arguments);
+        try {
+          var overrideVal = evalDeviceQuery(arguments[0]);
+          if (overrideVal !== null && mql) mqlOverrides.set(mql, overrideVal);
+        } catch (e) {
+          /* ignore */
+        }
+        return mql;
+      });
+    }
   }
 
   /* ---------------------------------- canvas --------------------------------- */
 
-  if (CFG.canvasNoise && typeof HTMLCanvasElement !== 'undefined') {
+  if (CFG.canvasNoise) {
     var CAN_SEED = hash32(CFG.seed + ':canvas');
 
     function perturb(data) {
@@ -111,101 +251,148 @@
       return data;
     }
 
-    var C2D = CanvasRenderingContext2D.prototype;
-    var origGetImageData = C2D.getImageData;
-
-    C2D.getImageData = mask(function getImageData() {
-      var img = origGetImageData.apply(this, arguments);
-      try {
-        perturb(img.data);
-      } catch (e) {
-        /* ignore */
-      }
-      return img;
-    }, 'getImageData');
-
-    function noisyCopy(src) {
-      var w = src.width || 0;
-      var h = src.height || 0;
-      if (!w || !h || w * h > 16777216) return null;
-      var t = document.createElement('canvas');
-      t.width = w;
-      t.height = h;
-      var ctx = t.getContext('2d');
-      if (!ctx) return null;
-      ctx.drawImage(src, 0, 0);
-      var img = origGetImageData.call(ctx, 0, 0, w, h);
-      perturb(img.data);
-      ctx.putImageData(img, 0, 0);
-      return t;
-    }
-
-    var origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-    HTMLCanvasElement.prototype.toDataURL = mask(function toDataURL() {
-      var target = this;
-      try {
-        target = noisyCopy(this) || this;
-      } catch (e) {
-        target = this;
-      }
-      return origToDataURL.apply(target, arguments);
-    }, 'toDataURL');
-
-    var origToBlob = HTMLCanvasElement.prototype.toBlob;
-    HTMLCanvasElement.prototype.toBlob = mask(function toBlob() {
-      var target = this;
-      try {
-        target = noisyCopy(this) || this;
-      } catch (e) {
-        target = this;
-      }
-      return origToBlob.apply(target, arguments);
-    }, 'toBlob');
-
-    if (typeof OffscreenCanvas !== 'undefined' && OffscreenCanvas.prototype.convertToBlob) {
-      var origConvertToBlob = OffscreenCanvas.prototype.convertToBlob;
-      OffscreenCanvas.prototype.convertToBlob = mask(function convertToBlob() {
+    function patch2DGetImageData(proto) {
+      if (!proto || !proto.getImageData) return null;
+      var orig = proto.getImageData;
+      proto.getImageData = makeMethod('getImageData', orig.length, function () {
+        var img = orig.apply(this, arguments);
         try {
-          var ctx = this.getContext('2d');
-          if (ctx && this.width && this.height) {
-            var img = origGetImageData.call(ctx, 0, 0, this.width, this.height);
-            perturb(img.data);
-            ctx.putImageData(img, 0, 0);
-          }
+          perturb(img.data);
         } catch (e) {
           /* ignore */
         }
-        return origConvertToBlob.apply(this, arguments);
-      }, 'convertToBlob');
+        return img;
+      });
+      return orig;
+    }
+
+    var origGetImageData =
+      typeof CanvasRenderingContext2D !== 'undefined'
+        ? patch2DGetImageData(CanvasRenderingContext2D.prototype)
+        : null;
+    var origOCGetImageData =
+      typeof OffscreenCanvasRenderingContext2D !== 'undefined'
+        ? patch2DGetImageData(OffscreenCanvasRenderingContext2D.prototype)
+        : null;
+
+    if (IS_WINDOW && typeof HTMLCanvasElement !== 'undefined') {
+      function noisyCopy(src) {
+        var w = src.width || 0;
+        var h = src.height || 0;
+        if (!w || !h || w * h > 16777216) return null;
+        var t = document.createElement('canvas');
+        t.width = w;
+        t.height = h;
+        var ctx = t.getContext('2d');
+        if (!ctx) return null;
+        ctx.drawImage(src, 0, 0);
+        var getImg = origGetImageData || ctx.getImageData;
+        var img = getImg.call(ctx, 0, 0, w, h);
+        perturb(img.data);
+        ctx.putImageData(img, 0, 0);
+        return t;
+      }
+
+      var origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+      HTMLCanvasElement.prototype.toDataURL = makeMethod('toDataURL', origToDataURL.length, function () {
+        var target = this;
+        try {
+          target = noisyCopy(this) || this;
+        } catch (e) {
+          target = this;
+        }
+        return origToDataURL.apply(target, arguments);
+      });
+
+      var origToBlob = HTMLCanvasElement.prototype.toBlob;
+      HTMLCanvasElement.prototype.toBlob = makeMethod('toBlob', origToBlob.length, function () {
+        var target = this;
+        try {
+          target = noisyCopy(this) || this;
+        } catch (e) {
+          target = this;
+        }
+        return origToBlob.apply(target, arguments);
+      });
+    }
+
+    if (typeof OffscreenCanvas !== 'undefined' && OffscreenCanvas.prototype.convertToBlob) {
+      var origConvertToBlob = OffscreenCanvas.prototype.convertToBlob;
+      OffscreenCanvas.prototype.convertToBlob = makeMethod('convertToBlob', origConvertToBlob.length, function () {
+        var target = this;
+        try {
+          var w = this.width || 0;
+          var h = this.height || 0;
+          if (w && h && w * h <= 16777216) {
+            var tmp = new OffscreenCanvas(w, h);
+            var tctx = tmp.getContext('2d');
+            if (tctx) {
+              tctx.drawImage(this, 0, 0);
+              var getImg = origOCGetImageData || tctx.getImageData;
+              var img = getImg.call(tctx, 0, 0, w, h);
+              perturb(img.data);
+              tctx.putImageData(img, 0, 0);
+              target = tmp;
+            }
+          }
+        } catch (e) {
+          target = this;
+        }
+        return origConvertToBlob.apply(target, arguments);
+      });
     }
   }
 
   /* ---------------------------------- text ----------------------------------- */
 
-  if (CFG.textNoise !== false && typeof CanvasRenderingContext2D !== 'undefined') {
+  if (CFG.textNoise !== false) {
     var T_SEED = hash32(CFG.seed + ':text');
-    var origMeasureText = CanvasRenderingContext2D.prototype.measureText;
-    CanvasRenderingContext2D.prototype.measureText = mask(function measureText(txt) {
-      var m = origMeasureText.apply(this, arguments);
-      try {
-        var h = hash32(T_SEED + '|' + String(txt));
-        var delta = ((h % 2000) - 1000) / 100000;
-        Object.defineProperty(m, 'width', {
-          value: m.width + delta,
-          configurable: true,
-          enumerable: true,
-          writable: true,
-        });
-      } catch (e) {
-        /* ignore */
+    var textWidthMap = new WeakMap();
+    if (typeof TextMetrics !== 'undefined') {
+      var twDesc = Object.getOwnPropertyDescriptor(TextMetrics.prototype, 'width');
+      if (twDesc && twDesc.get) {
+        var origTextWidth = twDesc.get;
+        try {
+          Object.defineProperty(TextMetrics.prototype, 'width', {
+            configurable: twDesc.configurable,
+            enumerable: twDesc.enumerable,
+            get: makeGetter('width', function () {
+              if (textWidthMap.has(this)) return textWidthMap.get(this);
+              return origTextWidth.call(this);
+            }),
+          });
+        } catch (e) {
+          /* ignore */
+        }
       }
-      return m;
-    }, 'measureText');
+    }
+
+    function patchTextNoise(proto) {
+      if (!proto || !proto.measureText) return;
+      var orig = proto.measureText;
+      proto.measureText = makeMethod('measureText', orig.length, function (txt) {
+        var m = orig.apply(this, arguments);
+        try {
+          if (m && typeof m.width === 'number') {
+            var h = hash32(T_SEED + '|' + String(txt));
+            var delta = ((h % 2000) - 1000) / 100000;
+            textWidthMap.set(m, m.width + delta);
+          }
+        } catch (e) {
+          /* ignore */
+        }
+        return m;
+      });
+    }
+    patchTextNoise(typeof CanvasRenderingContext2D !== 'undefined' ? CanvasRenderingContext2D.prototype : null);
+    patchTextNoise(
+      typeof OffscreenCanvasRenderingContext2D !== 'undefined' ? OffscreenCanvasRenderingContext2D.prototype : null
+    );
   }
 
   /* ---------------------------------- 字体 ----------------------------------- */
   /**
-   * 字体探测只有两条路：`document.fonts.check()` 和 `measureText()` 的宽度差。
+   * 字体探测只有两条路：document.fonts.check() 和 measureText() 的宽度差。
    * 把"声明平台没有的字体"当成不存在：check 返回 false，measureText 按回退字体量，
    * 这样在 Windows 上跑 macOS 指纹时，不会露出 Microsoft YaHei / SimSun 这一套系统字体。
    */
@@ -231,10 +418,11 @@
      */
     function isDeclaredFamily(name) {
       try {
-        if (!document.fonts || !document.fonts.size) return false;
+        var fontSet = IS_WINDOW ? document.fonts : G.fonts;
+        if (!fontSet || !fontSet.size) return false;
         var target = bareFamily(name).toLowerCase();
         var hit = false;
-        document.fonts.forEach(function (face) {
+        fontSet.forEach(function (face) {
           if (hit || !face) return;
           if (bareFamily(face.family).toLowerCase() === target) hit = true;
         });
@@ -282,7 +470,7 @@
 
     var origCheck = FontFaceSet.prototype.check;
     if (origCheck) {
-      FontFaceSet.prototype.check = mask(function check(font) {
+      FontFaceSet.prototype.check = makeMethod('check', origCheck.length, function (font) {
         try {
           var fam = firstFamily(String(font || ''));
           if (fam && !isAllowedFamily(fam)) return false;
@@ -290,13 +478,13 @@
           /* ignore */
         }
         return origCheck.apply(this, arguments);
-      }, 'check');
+      });
     }
 
     function patchMeasureText(proto) {
       if (!proto || !proto.measureText) return;
       var orig = proto.measureText;
-      proto.measureText = mask(function measureText() {
+      proto.measureText = makeMethod('measureText', orig.length, function () {
         var before = null;
         try {
           before = this.font;
@@ -316,7 +504,7 @@
             }
           }
         }
-      }, 'measureText');
+      });
     }
     patchMeasureText(typeof CanvasRenderingContext2D !== 'undefined' ? CanvasRenderingContext2D.prototype : null);
     patchMeasureText(
@@ -348,7 +536,7 @@
   function patchGL(proto) {
     if (!proto || !proto.getParameter) return;
     var orig = proto.getParameter;
-    proto.getParameter = mask(function getParameter(p) {
+    proto.getParameter = makeMethod('getParameter', orig.length, function (p) {
       if (p === 37445) return CFG.webglVendor;
       if (p === 37446) return CFG.webglRenderer;
       if (p === 7936) return 'WebKit';
@@ -360,90 +548,105 @@
         if (p === 0x0d3a) return new Int32Array([glTier.view, glTier.view]); // MAX_VIEWPORT_DIMS
       }
       return orig.apply(this, arguments);
-    }, 'getParameter');
+    });
 
     var origExt = proto.getExtension;
     if (origExt) {
-      proto.getExtension = mask(function getExtension(name) {
+      proto.getExtension = makeMethod('getExtension', origExt.length, function (name) {
         var r = origExt.apply(this, arguments);
         if (!r && name === 'WEBGL_debug_renderer_info') {
           return { UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446 };
         }
         return r;
-      }, 'getExtension');
+      });
     }
   }
   patchGL(typeof WebGLRenderingContext !== 'undefined' ? WebGLRenderingContext.prototype : null);
   patchGL(typeof WebGL2RenderingContext !== 'undefined' ? WebGL2RenderingContext.prototype : null);
 
   /* --------------------------------- WebGPU ---------------------------------- */
-  // WebGPU 的 adapter.info 会直说真实 GPU 家族（实测：声明 NVIDIA 的 WebGL 旁边
-  // 站着 vendor:"intel"），是"设备级"标识里最硬的一个，必须和 WebGL 声明对齐。
-  var GPU_FAMILY = {
-    NVIDIA: { vendor: 'nvidia', architecture: 'ampere' },
-    Intel: { vendor: 'intel', architecture: 'gen-12lp' },
-    AMD: { vendor: 'amd', architecture: 'rdna-2' },
-    Apple: { vendor: 'apple', architecture: 'metal-3' },
-    Microsoft: { vendor: 'microsoft', architecture: 'd3d12' },
-  };
+  // WebGPU 的 adapter.info 会直说真实 GPU 家族和架构，必须和 WebGL 声明的型号对齐。
   (function () {
-    var decl = String(CFG.webglVendor || '');
+    var declVendor = String(CFG.webglVendor || '');
+    var declRenderer = String(CFG.webglRenderer || '');
     var fam = null;
-    for (var k in GPU_FAMILY) {
-      if (Object.prototype.hasOwnProperty.call(GPU_FAMILY, k) && decl.indexOf(k) >= 0) {
-        fam = GPU_FAMILY[k];
-        break;
-      }
+    if (declVendor.indexOf('NVIDIA') >= 0) {
+      var nvArch = 'ampere';
+      if (/GTX\s*16|RTX\s*20/i.test(declRenderer)) nvArch = 'turing';
+      else if (/RTX\s*40/i.test(declRenderer)) nvArch = 'lovelace';
+      else if (/RTX\s*50/i.test(declRenderer)) nvArch = 'blackwell';
+      fam = { vendor: 'nvidia', architecture: nvArch };
+    } else if (declVendor.indexOf('Intel') >= 0) {
+      var inArch = /UHD\s*Graphics\s*6\d\d|Iris.*Plus/i.test(declRenderer) ? 'gen-9' : 'gen-12lp';
+      fam = { vendor: 'intel', architecture: inArch };
+    } else if (declVendor.indexOf('AMD') >= 0) {
+      var amdArch = 'gcn-5';
+      if (/RX\s*7\d\d\d/i.test(declRenderer)) amdArch = 'rdna-3';
+      else if (/RX\s*6\d\d\d/i.test(declRenderer)) amdArch = 'rdna-2';
+      fam = { vendor: 'amd', architecture: amdArch };
+    } else if (declVendor.indexOf('Apple') >= 0) {
+      fam = { vendor: 'apple', architecture: 'metal-3' };
+    } else if (declVendor.indexOf('Microsoft') >= 0) {
+      fam = { vendor: 'microsoft', architecture: 'd3d12' };
     }
     if (!fam || typeof GPUAdapter === 'undefined') return;
-    var info = { vendor: fam.vendor, architecture: fam.architecture, device: '', description: '' };
 
-    try {
-      Object.defineProperty(GPUAdapter.prototype, 'info', {
-        configurable: true,
-        enumerable: true,
-        get: mask(function () {
-          return info;
-        }, 'get info'),
+    if (typeof GPUAdapterInfo !== 'undefined') {
+      defineGetters(GPUAdapterInfo.prototype, {
+        vendor: fam.vendor,
+        architecture: fam.architecture,
+        device: '',
+        description: '',
       });
-    } catch (e) {
-      /* ignore */
-    }
-    if (GPUAdapter.prototype.requestAdapterInfo) {
-      GPUAdapter.prototype.requestAdapterInfo = mask(function requestAdapterInfo() {
-        return Promise.resolve(info);
-      }, 'requestAdapterInfo');
+      if (GPUAdapter.prototype.requestAdapterInfo) {
+        var origReqInfo = GPUAdapter.prototype.requestAdapterInfo;
+        GPUAdapter.prototype.requestAdapterInfo = makeMethod('requestAdapterInfo', origReqInfo.length, function () {
+          var selfAdapter = this;
+          return Promise.resolve(origReqInfo.apply(this, arguments)).then(function (realInfo) {
+            if (realInfo) return realInfo;
+            return selfAdapter.info;
+          });
+        });
+      }
+      return;
     }
 
-    // 有些版本把 info 做成实例属性，这里补一道：拦截 requestAdapter，在返回对象上钉住
+    var fallbackInfo = { vendor: fam.vendor, architecture: fam.architecture, device: '', description: '' };
+    defineGetters(GPUAdapter.prototype, { info: fallbackInfo });
+    if (GPUAdapter.prototype.requestAdapterInfo) {
+      GPUAdapter.prototype.requestAdapterInfo = makeMethod('requestAdapterInfo', 0, function () {
+        return Promise.resolve(fallbackInfo);
+      });
+    }
+
     var GPUProto = typeof GPU !== 'undefined' ? GPU.prototype : null;
     if (GPUProto && GPUProto.requestAdapter) {
       var origRequestAdapter = GPUProto.requestAdapter;
-      GPUProto.requestAdapter = mask(function requestAdapter() {
+      GPUProto.requestAdapter = makeMethod('requestAdapter', origRequestAdapter.length, function () {
         return Promise.resolve(origRequestAdapter.apply(this, arguments)).then(function (a) {
           if (a) {
             try {
-              Object.defineProperty(a, 'info', { value: info, configurable: true, enumerable: true });
+              Object.defineProperty(a, 'info', { value: fallbackInfo, configurable: true, enumerable: true });
             } catch (e) {
               /* ignore */
             }
           }
           return a;
         });
-      }, 'requestAdapter');
+      });
     }
   })();
 
   /* ----------------------------- 语音合成设备 ------------------------------ */
-  // 实测：Windows 暴露 "Microsoft Huihui / Kangkang / Yaoyao" 等 SAPI 语音，
-  // macOS 是 Samantha / Ting-Ting 那一套。只在"声明的系统 ≠ 真实系统"时才改，
-  // 这样绝大多数（Windows 上跑 Windows 指纹）用户完全不受影响。
+  // Windows 暴露 "Microsoft Huihui / Kangkang / Yaoyao" 等中文 SAPI 语音；
+  // 跨平台伪装、或者在中文宿主上运行美区/英区/日区 Windows 环境时，必须对齐语音列表。
   if (
+    IS_WINDOW &&
     typeof SpeechSynthesis !== 'undefined' &&
     typeof speechSynthesis !== 'undefined' &&
     CFG.platform &&
-    CFG.realPlatform &&
-    CFG.platform !== CFG.realPlatform
+    ((CFG.realPlatform && CFG.platform !== CFG.realPlatform) ||
+      (CFG.platform === 'win' && !/^zh(-CN|-Hans)?$/i.test(String(CFG.locale || ''))))
   ) {
     var GOOGLE_VOICES = [
       ['Google US English', 'en-US'],
@@ -457,14 +660,38 @@
       ['Google français', 'fr-FR'],
       ['Google español', 'es-ES'],
     ];
-    var WIN_VOICES = [
-      ['Microsoft Huihui - Chinese (Simplified, PRC)', 'zh-CN'],
-      ['Microsoft Kangkang - Chinese (Simplified, PRC)', 'zh-CN'],
-      ['Microsoft Yaoyao - Chinese (Simplified, PRC)', 'zh-CN'],
-      ['Microsoft Zira - English (United States)', 'en-US'],
-      ['Microsoft David - English (United States)', 'en-US'],
-      ['Microsoft Hazel - English (Great Britain)', 'en-GB'],
-    ];
+    var WIN_VOICES_BY_LOCALE = {
+      'en-GB': [
+        ['Microsoft Hazel - English (Great Britain)', 'en-GB'],
+        ['Microsoft Susan - English (Great Britain)', 'en-GB'],
+        ['Microsoft George - English (Great Britain)', 'en-GB'],
+      ],
+      'de-DE': [
+        ['Microsoft Hedda - German (Germany)', 'de-DE'],
+        ['Microsoft Katja - German (Germany)', 'de-DE'],
+        ['Microsoft Stefan - German (Germany)', 'de-DE'],
+      ],
+      'ja-JP': [
+        ['Microsoft Haruka - Japanese (Japan)', 'ja-JP'],
+        ['Microsoft Ayumi - Japanese (Japan)', 'ja-JP'],
+        ['Microsoft Ichiro - Japanese (Japan)', 'ja-JP'],
+      ],
+      'zh-TW': [
+        ['Microsoft Hanhan - Chinese (Traditional, Taiwan)', 'zh-TW'],
+        ['Microsoft Yating - Chinese (Traditional, Taiwan)', 'zh-TW'],
+        ['Microsoft Zhiwei - Chinese (Traditional, Taiwan)', 'zh-TW'],
+      ],
+      'zh-CN': [
+        ['Microsoft Huihui - Chinese (Simplified, PRC)', 'zh-CN'],
+        ['Microsoft Kangkang - Chinese (Simplified, PRC)', 'zh-CN'],
+        ['Microsoft Yaoyao - Chinese (Simplified, PRC)', 'zh-CN'],
+      ],
+      'en-US': [
+        ['Microsoft David - English (United States)', 'en-US'],
+        ['Microsoft Zira - English (United States)', 'en-US'],
+        ['Microsoft Mark - English (United States)', 'en-US'],
+      ],
+    };
     var MAC_VOICES = [
       ['Samantha', 'en-US'],
       ['Alex', 'en-US'],
@@ -479,30 +706,73 @@
       ['Anna', 'de-DE'],
       ['Thomas', 'fr-FR'],
     ];
-    var extra = CFG.platform === 'win' ? WIN_VOICES : CFG.platform === 'mac' ? MAC_VOICES : [];
+
+    function pickWinVoices(loc) {
+      var s = String(loc || '');
+      if (/^en-GB/i.test(s)) return WIN_VOICES_BY_LOCALE['en-GB'];
+      if (/^de/i.test(s)) return WIN_VOICES_BY_LOCALE['de-DE'];
+      if (/^ja/i.test(s)) return WIN_VOICES_BY_LOCALE['ja-JP'];
+      if (/^zh-(TW|HK|MO|Hant)/i.test(s)) return WIN_VOICES_BY_LOCALE['zh-TW'];
+      if (/^zh/i.test(s)) return WIN_VOICES_BY_LOCALE['zh-CN'];
+      return WIN_VOICES_BY_LOCALE['en-US'];
+    }
+
+    var extra =
+      CFG.platform === 'win'
+        ? pickWinVoices(CFG.locale)
+        : CFG.platform === 'mac'
+          ? MAC_VOICES
+          : [];
+
+    var voiceDataMap = new WeakMap();
+    var HasVoiceProto = typeof SpeechSynthesisVoice !== 'undefined';
+    if (HasVoiceProto) {
+      var voiceProps = ['name', 'lang', 'voiceURI', 'localService', 'default'];
+      for (var vi = 0; vi < voiceProps.length; vi++) {
+        (function (vp) {
+          var vd = Object.getOwnPropertyDescriptor(SpeechSynthesisVoice.prototype, vp);
+          if (!vd || !vd.get) return;
+          var origVGet = vd.get;
+          try {
+            Object.defineProperty(SpeechSynthesisVoice.prototype, vp, {
+              configurable: vd.configurable,
+              enumerable: vd.enumerable,
+              get: makeGetter(vp, function () {
+                var rec = voiceDataMap.get(this);
+                if (rec) return rec[vp];
+                return origVGet.call(this);
+              }),
+            });
+          } catch (e) {
+            /* ignore */
+          }
+        })(voiceProps[vi]);
+      }
+    }
+
     var fakeVoices = GOOGLE_VOICES.concat(extra).map(function (v, i) {
-      var o = {
+      var meta = {
         name: v[0],
         lang: v[1],
         voiceURI: v[0],
         localService: i >= GOOGLE_VOICES.length,
         default: v[0] === 'Google US English',
       };
-      try {
-        Object.defineProperty(o, Symbol.toStringTag, { value: 'SpeechSynthesisVoice' });
-      } catch (e) {
-        /* ignore */
+      if (HasVoiceProto) {
+        var o = Object.create(SpeechSynthesisVoice.prototype);
+        voiceDataMap.set(o, meta);
+        return o;
       }
-      return o;
+      return meta;
     });
     try {
       Object.defineProperty(SpeechSynthesis.prototype, 'getVoices', {
         configurable: true,
         enumerable: true,
         writable: true,
-        value: mask(function getVoices() {
-          return fakeVoices;
-        }, 'getVoices'),
+        value: makeMethod('getVoices', 0, function () {
+          return fakeVoices.slice();
+        }),
       });
     } catch (e) {
       /* ignore */
@@ -522,7 +792,7 @@
       h = Math.imul(h ^ (h >>> 15), 2246822519) >>> 0;
       return h & 1 ? 1e-7 : -1e-7;
     }
-    function perturb(d, start) {
+    function perturbAudio(d, start) {
       var s = start || 0;
       var first = (97 - (s % 97)) % 97;
       for (var i = first; i < d.length; i += 97) {
@@ -531,53 +801,61 @@
     }
 
     var origGetChannelData = AudioBuffer.prototype.getChannelData;
-    AudioBuffer.prototype.getChannelData = mask(function getChannelData() {
+    AudioBuffer.prototype.getChannelData = makeMethod('getChannelData', origGetChannelData.length, function () {
       var d = origGetChannelData.apply(this, arguments);
       try {
         if (!touched.has(this)) {
           touched.add(this);
-          perturb(d, 0);
+          perturbAudio(d, 0);
         }
       } catch (e) {
         /* ignore */
       }
       return d;
-    }, 'getChannelData');
+    });
 
     var origCopyFromChannel = AudioBuffer.prototype.copyFromChannel;
     if (origCopyFromChannel) {
-      AudioBuffer.prototype.copyFromChannel = mask(function copyFromChannel(dest, channel, start) {
-        origCopyFromChannel.apply(this, arguments);
-        try {
-          // 内部数据还没被 getChannelData 改过时，这里补上同一套偏移；
-          // 已经改过就直接用（避免同一个 buffer 被加两次噪声）
-          if (!touched.has(this) && dest && dest.length) perturb(dest, Number(start) || 0);
-        } catch (e) {
-          /* ignore */
+      AudioBuffer.prototype.copyFromChannel = makeMethod(
+        'copyFromChannel',
+        origCopyFromChannel.length,
+        function (dest, channel, start) {
+          origCopyFromChannel.apply(this, arguments);
+          try {
+            // 内部数据还没被 getChannelData 改过时，这里补上同一套偏移；
+            // 已经改过就直接用（避免同一个 buffer 被加两次噪声）
+            if (!touched.has(this) && dest && dest.length) perturbAudio(dest, Number(start) || 0);
+          } catch (e) {
+            /* ignore */
+          }
         }
-      }, 'copyFromChannel');
+      );
     }
 
     if (typeof AnalyserNode !== 'undefined') {
       var origFloat = AnalyserNode.prototype.getFloatFrequencyData;
-      AnalyserNode.prototype.getFloatFrequencyData = mask(function getFloatFrequencyData(arr) {
-        origFloat.call(this, arr);
-        try {
-          var h = AUD_SEED;
-          for (var i = 0; i < arr.length; i += 13) {
-            h = (Math.imul(h, 1664525) + 1013904223) >>> 0;
-            if (arr[i] !== -Infinity) arr[i] = arr[i] + (h & 1 ? 1e-4 : -1e-4);
+      AnalyserNode.prototype.getFloatFrequencyData = makeMethod(
+        'getFloatFrequencyData',
+        origFloat.length,
+        function (arr) {
+          origFloat.call(this, arr);
+          try {
+            var h = AUD_SEED;
+            for (var i = 0; i < arr.length; i += 13) {
+              h = (Math.imul(h, 1664525) + 1013904223) >>> 0;
+              if (arr[i] !== -Infinity) arr[i] = arr[i] + (h & 1 ? 1e-4 : -1e-4);
+            }
+          } catch (e) {
+            /* ignore */
           }
-        } catch (e) {
-          /* ignore */
         }
-      }, 'getFloatFrequencyData');
+      );
     }
   }
 
   /* --------------------------------- WebRTC ---------------------------------- */
 
-  if (CFG.webrtc && CFG.webrtc !== 'real') {
+  if (IS_WINDOW && CFG.webrtc && CFG.webrtc !== 'real') {
     var FAKE_IP = CFG.fakeIp || '192.168.1.88';
     var DISABLED = CFG.webrtc === 'disabled';
     var IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
@@ -619,17 +897,17 @@
       var d = Object.getOwnPropertyDescriptor(Ctor.prototype, prop);
       if (d && d.get) {
         Object.defineProperty(Ctor.prototype, prop, {
-          configurable: true,
-          enumerable: true,
-          get: mask(function () {
+          configurable: d.configurable,
+          enumerable: d.enumerable,
+          get: makeGetter(prop, function () {
             return clean(d.get.call(this));
-          }, 'get ' + prop),
+          }),
         });
       }
       // toJSON 读的是内部槽，不经过上面的 getter —— 不补就是一个现成的绕过口
       var origJSON = Ctor.prototype.toJSON;
       if (typeof origJSON === 'function') {
-        Ctor.prototype.toJSON = mask(function toJSON() {
+        Ctor.prototype.toJSON = makeMethod('toJSON', origJSON.length, function () {
           var o = origJSON.apply(this, arguments);
           if (o && typeof o === 'object' && typeof o[prop] === 'string') {
             var copy = Object.assign({}, o);
@@ -637,7 +915,7 @@
             return copy;
           }
           return o;
-        }, 'toJSON');
+        });
       }
     }
     patchRtcCtor('RTCSessionDescription', 'sdp', cleanSdp);
@@ -665,12 +943,12 @@
 
   /* -------------------------------- ClientRect -------------------------------- */
 
-  if (CFG.rectNoise && typeof Element !== 'undefined') {
+  if (IS_WINDOW && CFG.rectNoise && typeof Element !== 'undefined') {
     var R_SEED = hash32(CFG.seed + ':rect');
     var rectMap = new WeakMap();
     var counter = 0;
     var origRect = Element.prototype.getBoundingClientRect;
-    Element.prototype.getBoundingClientRect = mask(function getBoundingClientRect() {
+    Element.prototype.getBoundingClientRect = makeMethod('getBoundingClientRect', origRect.length, function () {
       var r = origRect.apply(this, arguments);
       try {
         var v = rectMap.get(this);
@@ -683,6 +961,6 @@
       } catch (e) {
         return r;
       }
-    }, 'getBoundingClientRect');
+    });
   }
 })();
