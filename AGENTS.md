@@ -65,10 +65,12 @@ fb.exe list --json
 | `create` | 新建一个或多个环境 |
 | `clone <id> [--name 名]` | 克隆：配置照抄，但换新 seed（画布/音频噪声、WebRTC 假 IP 都变），Cookie 不复制 |
 | `rm <id>... \| --group <g>` | 删除（运行中会先关掉） |
-| `launch <id>... \| --group <g> \| --all` | 启动，进程 detach，命令立即返回 |
+| `launch <id>... \| --group <g> \| --all [--auto-geo]` | 启动，进程 detach，命令立即返回；加 `--auto-geo` 按代理出口对齐地区与经纬度 |
 | `stop <id>... \| --group <g> \| --all` | 关闭 |
 | `probe <id>` | 在环境里读一次真实指纹（需要已启动） |
 | `proxy-test <id>` | 经该环境的代理取出口 IP，并和直连 IP 对比 |
+| `cookie-export <id> [文件.json]` | 导出环境 Cookie（明文 JSON，可跨机迁移，不给文件打到 stdout） |
+| `cookie-import <id> <文件>` | 导入 Cookie（支持 EditThisCookie JSON 或 Netscape 格式，传 `@-` 读 stdin） |
 | `export [文件]` | 导出 JSON（**不含代理密码**）；不给文件就打到 stdout |
 | `import <文件>` | 导入，全部当新环境（新 id、密码清空） |
 | `presets` | 列出内置地区预设 |
@@ -84,6 +86,7 @@ fb.exe list --json
 | `--proxy <串>` | 单个代理 |
 | `--group <名>` | 分组（默认用预设的中文名） |
 | `--name <名>` | 名称；`--count > 1` 时自动加 `-1` `-2` 后缀 |
+| `--auto-geo` | 启动时自动按代理出口 IP 同步时区、语言与经纬度 |
 | `--spec '<json>'` 或 `--spec @file.json` | 直接给完整字段，优先级最高（字段见下） |
 
 代理支持的写法（任选其一，一行一个）：

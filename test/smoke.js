@@ -632,6 +632,19 @@ async function browserChecks() {
     eq(ra.webdriver, false, 'navigator.webdriver 为 false');
     ok(typeof ra.canvasHash === 'number' && ra.canvasHash !== 0, 'Canvas 指纹可读（' + ra.canvasHash + '）');
     ok(typeof ra.audioHash === 'number' && ra.audioHash > 0, 'Audio 指纹可读（' + ra.audioHash + '）');
+    ok(
+      ra.health &&
+        ra.health.workerConsistent === true &&
+        ra.health.iframeToStringClean === true &&
+        ra.health.illegalInvocationClean === true &&
+        ra.health.canvasSolidClean === true &&
+        ra.health.uaChConsistent === true,
+      'probe v2 健康体检 5 项指标全部通过',
+      ra.health
+    );
+
+    const prefA = JSON.parse(fs.readFileSync(path.join(store.profileDir(a.id), 'Default', 'Preferences'), 'utf8'));
+    eq(prefA && prefA.profile && prefA.profile.name, '测试A', 'Chrome Default/Preferences 已写入防串号环境名');
 
     // 深度反检测审计：原型链无痕 + Web Worker + OffscreenCanvas + UA-CH + 语音 + matchMedia
     const auditRaw = await launcher.evaluateInProbePage(
@@ -813,12 +826,33 @@ async function browserChecks() {
     ok(ra.webglRenderer !== rb.webglRenderer, '两个环境的 WebGL 渲染器不同');
     ok(JSON.stringify(ra.languages) !== JSON.stringify(rb.languages), '两个环境的语言不同');
 
-    // 同一环境重开：Canvas 指纹必须稳定（否则每次刷新都变＝异常）
+    // 同一环境重开：验证离线 Cookie 导入 + 运行态导出，以及 Canvas 确定性
     await launcher.stop(a.id);
     await sleep(600);
+    const impJson = await launcher.importCookies(a.id, [
+      {
+        name: 'json_ck',
+        value: 'v1',
+        domain: '.example.org',
+        path: '/',
+        secure: true,
+        expirationDate: Math.floor(Date.now() / 1000) + 86400,
+      },
+    ]);
+    eq(impJson.imported, 1, '离线状态导入 JSON 格式 Cookie 成功');
+    const netscapeTxt = '#HttpOnly_.example.net\tTRUE\t/\tTRUE\t1999999999\tnet_ck\tv2\n';
+    const impNet = await launcher.importCookies(a.id, netscapeTxt);
+    eq(impNet.imported, 1, '离线状态导入 Netscape 格式 Cookie 成功');
+
     await launcher.launch(a.id);
     const ra2 = await launcher.probe(a.id);
     eq(ra2.canvasHash, ra.canvasHash, '同一环境重启后 Canvas 指纹保持一致（确定性）');
+
+    const exportedCookies = await launcher.exportCookies(a.id);
+    const ckJson = exportedCookies.find((c) => c.name === 'json_ck');
+    const ckNet = exportedCookies.find((c) => c.name === 'net_ck');
+    ok(ckJson && ckJson.value === 'v1', '运行态导出包含离线导入的 JSON Cookie');
+    ok(ckNet && ckNet.value === 'v2' && ckNet.httpOnly === true, '运行态导出包含离线导入的 Netscape HttpOnly Cookie');
 
     // 隔离性：Cookie 目录必须分开
     const dirA = store.profileDir(a.id);

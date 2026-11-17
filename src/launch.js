@@ -11,7 +11,7 @@ const net = require('node:net');
 const { CDP } = require('./cdp');
 const { findBrowser } = require('./browser');
 const { createRelay, testProxy } = require('./proxy');
-const { countryToLocale, TIMEZONE_COORDS } = require('./cliutil');
+const { countryToLocale, TIMEZONE_COORDS, parseCookiesInput } = require('./cliutil');
 const runtime = require('./runtime');
 const store = require('./store');
 
@@ -848,6 +848,7 @@ async function launch(profileId, options = {}) {
 
   const userDataDir = store.profileDir(profileId);
   fs.mkdirSync(userDataDir, { recursive: true });
+  ensureChromeProfileName(userDataDir, profile.name);
   const logDir = path.join(store.DATA, 'logs');
   fs.mkdirSync(logDir, { recursive: true });
   const logPath = path.join(logDir, profileId + '.log');
@@ -1041,6 +1042,11 @@ async function launch(profileId, options = {}) {
       await cdp.try_('Page.navigate', { url: startUrl }, mainSession);
     }
 
+    try {
+      store.update(profileId, { lastLaunchedAt: new Date().toISOString() });
+    } catch {
+      /* ignore */
+    }
     return publicInfo(instance);
   } catch (e) {
     await stop(profileId);
@@ -1226,6 +1232,70 @@ const PROBE_EXPR = `(async () => {
       out.audioHash = Math.round(sum * 1e10) / 1e10;
     }
   } catch (e) { out.audioError = String(e); }
+
+  // 健康体检：交叉核验多开防关联关键指标
+  try {
+    const health = {};
+    try {
+      const wCode = [
+        'const r = { hc: navigator.hardwareConcurrency, gpu: null };',
+        'try { const oc = new OffscreenCanvas(16, 16); const gl = oc.getContext("webgl"); const ext = gl && gl.getExtension("WEBGL_debug_renderer_info"); r.gpu = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : null; } catch {}',
+        'postMessage(r);',
+      ].join('\\n');
+      const wRes = await new Promise((resolve) => {
+        const w = new Worker(URL.createObjectURL(new Blob([wCode], { type: 'application/javascript' })));
+        const t = setTimeout(() => resolve(null), 2000);
+        w.onmessage = (e) => { clearTimeout(t); w.terminate(); resolve(e.data); };
+        w.onerror = () => { clearTimeout(t); resolve(null); };
+      });
+      health.workerConsistent = !!(
+        wRes &&
+        wRes.hc === out.hardwareConcurrency &&
+        (!out.webglRenderer || wRes.gpu === out.webglRenderer)
+      );
+    } catch { health.workerConsistent = false; }
+
+    try {
+      const ifr = document.createElement('iframe');
+      document.body.appendChild(ifr);
+      const s = ifr.contentWindow.Function.prototype.toString.call(HTMLCanvasElement.prototype.toDataURL);
+      ifr.remove();
+      health.iframeToStringClean = typeof s === 'string' && s.indexOf('[native code]') >= 0;
+    } catch { health.iframeToStringClean = false; }
+
+    try {
+      const d = Object.getOwnPropertyDescriptor(Navigator.prototype, 'hardwareConcurrency');
+      let threw = false;
+      try { d.get.call({}); } catch (err) { threw = err instanceof TypeError; }
+      health.illegalInvocationClean = threw;
+    } catch { health.illegalInvocationClean = false; }
+
+    try {
+      const sc = document.createElement('canvas');
+      sc.width = 8; sc.height = 8;
+      const sctx = sc.getContext('2d');
+      sctx.fillStyle = '#123456';
+      sctx.fillRect(0, 0, 8, 8);
+      const sd = sctx.getImageData(0, 0, 8, 8).data;
+      let dirty = 0;
+      for (let i = 0; i < sd.length; i += 4) {
+        if (sd[i] !== 0x12 || sd[i + 1] !== 0x34 || sd[i + 2] !== 0x56) dirty++;
+      }
+      health.canvasSolidClean = dirty === 0;
+    } catch { health.canvasSolidClean = false; }
+
+    try {
+      if (!navigator.userAgentData) {
+        health.uaChConsistent = true;
+      } else {
+        const hv = await navigator.userAgentData.getHighEntropyValues(['brands', 'fullVersionList']);
+        health.uaChConsistent = Array.isArray(hv.brands) && Array.isArray(hv.fullVersionList) && hv.brands.length === hv.fullVersionList.length;
+      }
+    } catch { health.uaChConsistent = false; }
+
+    out.health = health;
+  } catch {}
+
   return JSON.stringify(out);
 })()`;
 
@@ -1306,6 +1376,105 @@ async function evaluateInProbePage(profileId, expression) {
   }
 }
 
+/** 写入 Chrome Profile 显示名（防多开窗口串号，网页 JS 不可见） */
+function ensureChromeProfileName(userDataDir, name) {
+  if (!name) return;
+  try {
+    const defDir = path.join(userDataDir, 'Default');
+    fs.mkdirSync(defDir, { recursive: true });
+    const prefFile = path.join(defDir, 'Preferences');
+    let prefs = {};
+    if (fs.existsSync(prefFile)) {
+      try {
+        prefs = JSON.parse(fs.readFileSync(prefFile, 'utf8'));
+      } catch {
+        return; // Preferences 损坏或格式异常时宁可跳过，不覆盖用户其它浏览器数据
+      }
+    }
+    if (!prefs || typeof prefs !== 'object') prefs = {};
+    prefs.profile = { ...(prefs.profile && typeof prefs.profile === 'object' ? prefs.profile : {}), name: String(name) };
+    const tmp = prefFile + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(prefs), 'utf8');
+    fs.renameSync(tmp, prefFile);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 运行态直接复用 CDP；已停止的环境则拉起临时 headless 读写 Cookies 后优雅关闭 */
+async function withCookieCdp(profileId, fn) {
+  const profile = store.get(profileId);
+  if (!profile) throw new Error('环境不存在：' + profileId);
+  const inst = running.get(profileId);
+  if (inst && inst.cdp) {
+    return await fn(inst.cdp);
+  }
+
+  const chromePath = findBrowser();
+  if (!chromePath) {
+    throw new Error('没找到 Chromium 内核浏览器');
+  }
+  const userDataDir = store.profileDir(profileId);
+  fs.mkdirSync(userDataDir, { recursive: true });
+  const port = await freePort();
+  const proc = spawn(
+    chromePath,
+    [
+      '--headless=new',
+      '--user-data-dir=' + userDataDir,
+      '--remote-debugging-port=' + port,
+      '--remote-debugging-address=127.0.0.1',
+      '--no-first-run',
+      '--no-default-browser-check',
+      'about:blank',
+    ],
+    { stdio: 'ignore', windowsHide: true }
+  );
+
+  let cdp = null;
+  try {
+    const { wsUrl } = await waitForDevTools(userDataDir, proc, 15000, port);
+    cdp = await CDP.connect(wsUrl, 8000);
+    return await fn(cdp);
+  } finally {
+    if (cdp) {
+      await cdp.try_('Browser.close');
+      cdp.close();
+    }
+    await new Promise((resolve) => {
+      if (proc.exitCode !== null) return resolve();
+      const timer = setTimeout(resolve, 3000);
+      proc.once('exit', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    if (proc.exitCode === null && proc.pid) {
+      await killTree(proc.pid);
+    }
+    await sleep(150);
+  }
+}
+
+async function exportCookies(profileId) {
+  const r = await withCookieCdp(profileId, (cdp) => cdp.send('Storage.getCookies'));
+  const list = (r && Array.isArray(r.cookies) ? r.cookies : []).map((c) => {
+    const item = { ...c };
+    if (typeof item.expires === 'number' && item.expires > 0) {
+      item.expirationDate = item.expires;
+    }
+    return item;
+  });
+  return list;
+}
+
+async function importCookies(profileId, input) {
+  const cookies = parseCookiesInput(input);
+  if (!cookies.length) throw new Error('没有可导入的合法 Cookie');
+  await withCookieCdp(profileId, (cdp) => cdp.send('Storage.setCookies', { cookies }));
+  return { imported: cookies.length };
+}
+
 /** 指纹检测：返回结构化的指纹报告 */
 async function probe(profileId) {
   const inst = running.get(profileId);
@@ -1322,6 +1491,8 @@ module.exports = {
   reattach,
   probe,
   evaluateInProbePage,
+  exportCookies,
+  importCookies,
   getRunning,
   listRunning,
   buildInjectionSource,

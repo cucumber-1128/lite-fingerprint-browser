@@ -43,18 +43,44 @@ function toast(msg, isErr) {
 
 let filterText = '';
 let filterGroup = '';
+const selectedIds = new Set();
+let cookieProfileId = null;
+let cachedCookies = [];
 
 function visibleProfiles() {
   const q = filterText.trim().toLowerCase();
   return (state.profiles || []).filter((p) => {
     if (filterGroup && (p.group || '') !== filterGroup) return false;
     if (!q) return true;
-    const hay = [p.name, p.group, p.platform, p.timezone, p.locale, p.proxy && p.proxy.host, p.id]
+    const hay = [p.name, p.group, p.notes, p.platform, p.timezone, p.locale, p.proxy && p.proxy.host, p.id]
       .filter(Boolean)
       .join(' ')
       .toLowerCase();
     return hay.indexOf(q) >= 0;
   });
+}
+
+function syncBatchBar() {
+  const bar = $('#batchBar');
+  if (!bar) return;
+  const all = state.profiles || [];
+  const validIds = new Set(all.map((p) => p.id));
+  for (const id of [...selectedIds]) {
+    if (!validIds.has(id)) selectedIds.delete(id);
+  }
+  bar.hidden = all.length === 0;
+  const list = visibleProfiles();
+  const visSelected = list.filter((p) => selectedIds.has(p.id)).length;
+  const chk = $('#chkSelectAll');
+  if (chk) {
+    chk.checked = list.length > 0 && visSelected === list.length;
+    chk.indeterminate = visSelected > 0 && visSelected < list.length;
+  }
+  $('#batchCount').textContent = '已选 ' + selectedIds.size + ' 个';
+  const none = selectedIds.size === 0;
+  $('#btnBatchLaunch').disabled = none;
+  $('#btnBatchStop').disabled = none;
+  $('#btnBatchDelete').disabled = none;
 }
 
 function render() {
@@ -84,13 +110,15 @@ function render() {
   grid.innerHTML = list
     .map((p) => {
       const running = !!p.running;
+      const checked = selectedIds.has(p.id);
       const proxy = p.proxy || {};
       const hasProxy = proxy.type && proxy.type !== 'none' && proxy.host;
       const proxyText = hasProxy ? proxy.type.toUpperCase() + ' ' + proxy.host + ':' + proxy.port : '直连';
       const scr = p.screen || {};
       return `
-      <article class="card ${running ? 'running' : ''}" data-id="${esc(p.id)}">
+      <article class="card ${running ? 'running' : ''} ${checked ? 'selected' : ''}" data-id="${esc(p.id)}">
         <div class="card-head">
+          <input type="checkbox" class="card-check" data-select="${esc(p.id)}" ${checked ? 'checked' : ''} title="选中此环境" />
           <span class="name">${esc(p.name)}</span>
           ${p.group ? `<span class="tag group" title="分组">${esc(p.group)}</span>` : ''}
           <span class="tag ${running ? 'on' : 'off'}">${running ? '运行中' : '已停止'}</span>
@@ -101,6 +129,7 @@ function render() {
           <span>时区 <code>${esc(p.timezone)}</code> · 语言 <code>${esc((p.languages || []).join(','))}</code></span>
           <span>WebGL <code>${esc((p.webglRenderer || '').slice(0, 46))}</code></span>
           <span>代理 <code>${esc(proxyText)}</code> · WebRTC ${esc(p.webrtc)}</span>
+          ${p.notes ? `<span class="note">备注 <code>${esc(p.notes)}</code></span>` : ''}
         </div>
         <div class="card-actions">
           ${
@@ -111,6 +140,7 @@ function render() {
                  <button class="btn" data-act="probe" disabled title="先启动环境">检测指纹</button>`
           }
           ${hasProxy ? `<button class="btn" data-act="proxy-test">测代理</button>` : ''}
+          <button class="btn ghost" data-act="cookies">Cookie</button>
           <button class="btn ghost" data-act="clone">克隆</button>
           <button class="btn ghost" data-act="edit">编辑</button>
           <button class="btn ghost danger" data-act="delete">删除</button>
@@ -118,6 +148,7 @@ function render() {
       </article>`;
     })
     .join('');
+  syncBatchBar();
 }
 
 /** 分组下拉：随时按现有分组重建，但保留当前选择 */
@@ -133,16 +164,27 @@ function renderGroupFilter() {
 }
 
 function renderPresetSelect() {
-  const sel = $('#presetSelect');
-  if (!sel) return;
-  const cur = sel.value;
   const presets = state.presets || [];
-  sel.innerHTML =
-    '<option value="">自定义</option>' +
-    presets
-      .map((p) => '<option value="' + esc(p.key) + '">' + esc(p.label + ' (' + p.key + ' · ' + p.timezone + ')') + '</option>')
-      .join('');
-  sel.value = presets.some((p) => p.key === cur) ? cur : '';
+  const sel = $('#presetSelect');
+  if (sel) {
+    const cur = sel.value;
+    sel.innerHTML =
+      '<option value="">自定义</option>' +
+      presets
+        .map((p) => '<option value="' + esc(p.key) + '">' + esc(p.label + ' (' + p.key + ' · ' + p.timezone + ')') + '</option>')
+        .join('');
+    sel.value = presets.some((p) => p.key === cur) ? cur : '';
+  }
+  const bsel = $('#batchPreset');
+  if (bsel) {
+    const bcur = bsel.value;
+    bsel.innerHTML =
+      '<option value="">默认随机</option>' +
+      presets
+        .map((p) => '<option value="' + esc(p.key) + '">' + esc(p.label + ' (' + p.key + ' · ' + p.timezone + ')') + '</option>')
+        .join('');
+    bsel.value = presets.some((p) => p.key === bcur) ? bcur : '';
+  }
 }
 
 let renderedJson = '';
@@ -199,6 +241,7 @@ function openEditor(profile) {
     const px = profile.proxy || {};
     setVal('name', profile.name);
     setVal('group', profile.group || '');
+    setVal('notes', profile.notes || '');
     setVal('startUrl', profile.startUrl);
     setVal('platform', profile.platform);
     setVal('timezone', profile.timezone);
@@ -231,6 +274,7 @@ function openEditor(profile) {
   } else {
     setVal('name', '');
     setVal('group', '');
+    setVal('notes', '');
     setVal('startUrl', 'about:blank');
     setVal('platform', 'win');
     setVal('timezone', 'Asia/Shanghai');
@@ -288,6 +332,7 @@ function readEditor() {
   return {
     name: getVal('name').trim(),
     group: getVal('group').trim(),
+    notes: getVal('notes').trim(),
     startUrl: getVal('startUrl').trim() || 'about:blank',
     platform: getVal('platform'),
     timezone: getVal('timezone').trim() || 'Asia/Shanghai',
@@ -356,6 +401,7 @@ async function saveEditor() {
 async function onCardAction(id, act, btn) {
   const p = state.profiles.find((x) => x.id === id);
   try {
+    if (act === 'cookies') return openCookieDlg(p);
     if (act === 'edit') return openEditor(p);
     if (act === 'delete') {
       if (!confirm('删除环境「' + p.name + '」？它的 Cookie 和登录态会一起删掉。')) return;
@@ -441,8 +487,32 @@ const LABELS = {
   audioHash: 'Audio 指纹哈希',
 };
 
+const HEALTH_LABELS = {
+  workerConsistent: '主线程 / Worker 硬件一致',
+  iframeToStringClean: '跨 iframe 原生函数伪装',
+  illegalInvocationClean: '非法调用 Brand Check',
+  canvasSolidClean: 'Canvas 纯色防陷阱',
+  uaChConsistent: 'UA-CH 品牌与高熵值一致',
+};
+
 function showReport(r) {
   const rows = [];
+  if (r.health && typeof r.health === 'object') {
+    for (const hk of Object.keys(HEALTH_LABELS)) {
+      if (r.health[hk] === undefined) continue;
+      const ok = !!r.health[hk];
+      rows.push(
+        '<div class="k">' +
+          esc(HEALTH_LABELS[hk]) +
+          '</div><div class="v"><span class="' +
+          (ok ? 'health-ok' : 'health-bad') +
+          '">' +
+          (ok ? '✓ 通过' : '✗ 异常') +
+          '</span></div>'
+      );
+    }
+    rows.push('<div class="health-sep"></div>');
+  }
   for (const k of Object.keys(LABELS)) {
     if (r[k] === undefined) continue;
     let v = r[k];
@@ -684,6 +754,200 @@ async function parseQuickProxy() {
 
 $('#proxyQuick').addEventListener('change', parseQuickProxy);
 $('#proxyQuick').addEventListener('paste', () => setTimeout(parseQuickProxy, 0));
+
+/* ------------------------------ 批量操作 & Cookie ------------------------------ */
+
+document.addEventListener('change', (e) => {
+  const chk = e.target.closest('input[data-select]');
+  if (!chk) return;
+  const id = chk.dataset.select;
+  if (chk.checked) selectedIds.add(id);
+  else selectedIds.delete(id);
+  const card = chk.closest('.card');
+  if (card) card.classList.toggle('selected', chk.checked);
+  syncBatchBar();
+});
+
+$('#chkSelectAll').addEventListener('change', (e) => {
+  const list = visibleProfiles();
+  for (const p of list) {
+    if (e.target.checked) selectedIds.add(p.id);
+    else selectedIds.delete(p.id);
+  }
+  render();
+});
+
+$('#btnBatchLaunch').addEventListener('click', async () => {
+  const ids = [...selectedIds];
+  if (!ids.length) return;
+  const btn = $('#btnBatchLaunch');
+  btn.disabled = true;
+  let okCount = 0;
+  let errCount = 0;
+  toast('正在批量启动 ' + ids.length + ' 个环境…');
+  for (const id of ids) {
+    try {
+      await api('/api/profiles/' + id + '/launch', { method: 'POST', body: {} });
+      okCount++;
+    } catch {
+      errCount++;
+    }
+  }
+  await load(true);
+  toast('批量启动完成：成功 ' + okCount + (errCount ? '，失败 ' + errCount : ''), errCount > 0);
+});
+
+$('#btnBatchStop').addEventListener('click', async () => {
+  const ids = [...selectedIds];
+  if (!ids.length) return;
+  const btn = $('#btnBatchStop');
+  btn.disabled = true;
+  let okCount = 0;
+  for (const id of ids) {
+    try {
+      const r = await api('/api/profiles/' + id + '/stop', { method: 'POST', body: {} });
+      if (r && r.ok) okCount++;
+    } catch {
+      /* ignore */
+    }
+  }
+  await load(true);
+  toast('已关闭 ' + okCount + ' 个运行中的环境');
+});
+
+$('#btnBatchDelete').addEventListener('click', async () => {
+  const ids = [...selectedIds];
+  if (!ids.length) return;
+  if (!confirm('删除选中的 ' + ids.length + ' 个环境？它们的 Cookie 和登录态会一起删掉。')) return;
+  const btn = $('#btnBatchDelete');
+  btn.disabled = true;
+  for (const id of ids) {
+    try {
+      await api('/api/profiles/' + id, { method: 'DELETE' });
+      selectedIds.delete(id);
+    } catch {
+      /* ignore */
+    }
+  }
+  await load(true);
+  toast('已删除选中环境');
+});
+
+$('#btnBatchNew').addEventListener('click', () => {
+  renderPresetSelect();
+  $('#batchErr').textContent = '';
+  $('#batchName').value = '';
+  $('#batchGroup').value = '';
+  $('#batchCountInput').value = '';
+  $('#batchProxies').value = '';
+  $('#batchAutoGeo').checked = false;
+  $('#batchDlg').showModal();
+});
+
+$('#btnCancelBatch').addEventListener('click', () => $('#batchDlg').close());
+
+$('#btnSubmitBatch').addEventListener('click', async () => {
+  const btn = $('#btnSubmitBatch');
+  $('#batchErr').textContent = '';
+  btn.disabled = true;
+  try {
+    const r = await api('/api/profiles/batch', {
+      method: 'POST',
+      body: {
+        preset: $('#batchPreset').value,
+        name: $('#batchName').value.trim(),
+        group: $('#batchGroup').value.trim(),
+        count: $('#batchCountInput').value ? Number($('#batchCountInput').value) : 0,
+        proxiesText: $('#batchProxies').value,
+        autoGeo: $('#batchAutoGeo').checked,
+      },
+    });
+    $('#batchDlg').close();
+    await load(true);
+    toast('已批量创建 ' + r.count + ' 个环境');
+  } catch (err) {
+    $('#batchErr').textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function openCookieDlg(profile) {
+  cookieProfileId = profile.id;
+  cachedCookies = [];
+  $('#cookieTitle').textContent = 'Cookie 管理 · ' + profile.name;
+  $('#cookieInfo').textContent = '正在读取 Cookie（未启动环境首次读取会稍慢）…';
+  $('#cookieText').value = '';
+  $('#cookieErr').textContent = '';
+  $('#cookieDlg').showModal();
+  try {
+    const r = await api('/api/profiles/' + encodeURIComponent(profile.id) + '/cookies');
+    cachedCookies = r.cookies || [];
+    $('#cookieInfo').textContent = '当前共有 ' + cachedCookies.length + ' 条 Cookie';
+  } catch (err) {
+    $('#cookieInfo').textContent = '读取失败';
+    $('#cookieErr').textContent = err.message;
+  }
+}
+
+$('#btnCloseCookie').addEventListener('click', () => $('#cookieDlg').close());
+
+$('#btnCopyCookies').addEventListener('click', async () => {
+  const json = JSON.stringify(cachedCookies, null, 2);
+  try {
+    await navigator.clipboard.writeText(json);
+    toast('已复制 ' + cachedCookies.length + ' 条 Cookie 到剪贴板');
+  } catch {
+    $('#cookieText').value = json;
+    toast('已填充到下方输入框，请手动复制');
+  }
+});
+
+$('#btnDownloadCookies').addEventListener('click', () => {
+  const blob = new Blob([JSON.stringify(cachedCookies, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'cookies-' + (cookieProfileId || 'profile') + '.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+
+$('#btnPickCookieFile').addEventListener('click', () => $('#cookieFile').click());
+$('#cookieFile').addEventListener('change', async (e) => {
+  const f = e.target.files && e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  $('#cookieText').value = await f.text();
+});
+
+$('#btnImportCookies').addEventListener('click', async () => {
+  if (!cookieProfileId) return;
+  const text = $('#cookieText').value.trim();
+  if (!text) {
+    $('#cookieErr').textContent = '请粘贴或选择要导入的 Cookie';
+    return;
+  }
+  const btn = $('#btnImportCookies');
+  btn.disabled = true;
+  $('#cookieErr').textContent = '';
+  try {
+    const r = await api('/api/profiles/' + encodeURIComponent(cookieProfileId) + '/cookies', {
+      method: 'POST',
+      body: { text },
+    });
+    toast('已导入 ' + r.imported + ' 条 Cookie');
+    const refreshed = await api('/api/profiles/' + encodeURIComponent(cookieProfileId) + '/cookies');
+    cachedCookies = refreshed.cookies || [];
+    $('#cookieInfo').textContent = '当前共有 ' + cachedCookies.length + ' 条 Cookie';
+    $('#cookieText').value = '';
+  } catch (err) {
+    $('#cookieErr').textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 $('#btnSyncGeo').addEventListener('click', async () => {
   const btn = $('#btnSyncGeo');

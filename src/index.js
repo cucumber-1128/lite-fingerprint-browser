@@ -450,6 +450,45 @@ async function cmdImport(file) {
   );
 }
 
+async function cmdCookieExport(id, file) {
+  if (!id) return fail('用法：cookie-export <环境ID> [输出文件.json]');
+  const live = await liveConsole();
+  let cookies;
+  if (live) {
+    const r = await consoleApi(live, 'GET', '/api/profiles/' + encodeURIComponent(id) + '/cookies', undefined, 25000);
+    cookies = r.cookies || [];
+  } else {
+    cookies = await launcher.exportCookies(id);
+  }
+  if (file) {
+    fs.writeFileSync(file, JSON.stringify(cookies, null, 2), 'utf8');
+    return emit(
+      { ok: true, id, file, count: cookies.length },
+      '✓ 已导出 ' + cookies.length + ' 条 Cookie 到 ' + file
+    );
+  }
+  return emit({ ok: true, id, count: cookies.length, cookies }, JSON.stringify(cookies, null, 2));
+}
+
+async function cmdCookieImport(id, file) {
+  if (!id || !file) return fail('用法：cookie-import <环境ID> <Cookie文件(JSON或Netscape)>');
+  const raw = file === '@-' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(file, 'utf8');
+  const live = await liveConsole();
+  let res;
+  if (live) {
+    res = await consoleApi(
+      live,
+      'POST',
+      '/api/profiles/' + encodeURIComponent(id) + '/cookies',
+      { text: raw },
+      25000
+    );
+  } else {
+    res = await launcher.importCookies(id, raw);
+  }
+  return emit({ ok: true, id, imported: res.imported }, '✓ 已导入 ' + res.imported + ' 条 Cookie');
+}
+
 async function cmdPresets() {
   const rows = Object.entries(PRESETS).map(([key, p]) => ({ key, ...p }));
   return emit(
@@ -510,10 +549,12 @@ function printHelp() {
     '  ' + bin + ' create --name 名称 [选项]         新建环境',
     '  ' + bin + ' clone <id> [--name 名称]          克隆（换新 seed）',
     '  ' + bin + ' rm <id>... | --group <g>          删除',
-    '  ' + bin + ' launch <id>... | --group <g>      启动',
+    '  ' + bin + ' launch <id>... | --group <g>      启动（加 --auto-geo 按代理自动对齐）',
     '  ' + bin + ' stop <id>... | --group <g> | --all  关闭',
     '  ' + bin + ' probe <id> [--json]               读一次真实指纹',
     '  ' + bin + ' proxy-test <id> [--json]          测出口 IP',
+    '  ' + bin + ' cookie-export <id> [文件.json]      导出环境 Cookie（支持跨机迁移）',
+    '  ' + bin + ' cookie-import <id> <文件>           导入 Cookie（JSON 或 Netscape）',
     '  ' + bin + ' export [文件.json]                导出（不含密码）',
     '  ' + bin + ' import <文件.json>                导入',
     '  ' + bin + ' presets [--json]                  列出地区预设',
@@ -525,6 +566,7 @@ function printHelp() {
     '  --proxies 文件        一行一个代理（# 注释）',
     '  --proxy <串>          单个代理，支持 http://user:pass@host:port',
     '  --group 名称          分组',
+    '  --auto-geo            启动时按代理出口自动同步时区/语言/经纬度',
     '  --spec <json|@文件>   直接给完整字段（优先级最高）',
     '',
     '所有命令都支持 --json：stdout 只有 JSON，退出码 0 成功 / 1 失败。',
@@ -701,6 +743,12 @@ async function main() {
       break;
     case 'import':
       await cmdImport(positional()[0]);
+      break;
+    case 'cookie-export':
+      await cmdCookieExport(positional()[0], positional()[1]);
+      break;
+    case 'cookie-import':
+      await cmdCookieImport(positional()[0], positional()[1]);
       break;
     case 'presets':
       await cmdPresets();

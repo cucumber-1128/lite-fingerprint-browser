@@ -10,7 +10,7 @@ const launcher = require('./launch');
 const runtime = require('./runtime');
 const { testProxy } = require('./proxy');
 const { findBrowser } = require('./browser');
-const { PRESETS, parseProxyLine, countryToLocale } = require('./cliutil');
+const { PRESETS, getPreset, parseProxyLine, parseProxies, countryToLocale } = require('./cliutil');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -253,6 +253,50 @@ function createServer(opts = {}) {
           return json(res, 200, withRunning(p));
         }
 
+        if (method === 'POST' && pathname === '/api/profiles/batch') {
+          const body = await readBody(req);
+          let preset = null;
+          if (body.preset) {
+            try {
+              preset = getPreset(body.preset);
+            } catch (e) {
+              return json(res, 400, { error: e && e.message ? e.message : String(e) });
+            }
+          }
+          let proxies = [];
+          try {
+            proxies = parseProxies(body.proxiesText || '');
+          } catch (e) {
+            return json(res, 400, { error: e && e.message ? e.message : String(e) });
+          }
+          const countRaw = Number(body.count);
+          const count = countRaw > 0 ? Math.min(100, Math.floor(countRaw)) : proxies.length || 1;
+          if (proxies.length && count > proxies.length) {
+            return json(res, 400, {
+              error: '代理只有 ' + proxies.length + ' 条，但数量为 ' + count + '（代理与环境必须一对一）',
+            });
+          }
+          const baseName = String(body.name || '').trim() || (preset ? preset.label : '新环境');
+          const group = String(body.group || '').trim() || (preset ? preset.label : '');
+          const created = [];
+          for (let i = 0; i < count; i++) {
+            const fields = {
+              name: count > 1 ? baseName + '-' + (i + 1) : baseName,
+              group,
+              autoGeo: body.autoGeo === true,
+            };
+            if (preset) {
+              fields.platform = preset.platform;
+              fields.locale = preset.locale;
+              fields.languages = preset.languages;
+              fields.timezone = preset.timezone;
+            }
+            if (proxies[i]) fields.proxy = proxies[i];
+            created.push(store.create(fields));
+          }
+          return json(res, 200, { ok: true, count: created.length, created: created.map(withRunning) });
+        }
+
         if (seg[0] === 'profiles' && seg[1]) {
           const id = seg[1];
           const action = seg[2];
@@ -323,6 +367,18 @@ function createServer(opts = {}) {
           if (method === 'POST' && action === 'sync-geo') {
             const { profile, proxy } = await launcher.syncProfileGeoFromProxy(id);
             return json(res, 200, { ok: true, profile: withRunning(profile), proxy });
+          }
+
+          if (method === 'GET' && action === 'cookies') {
+            const cookies = await launcher.exportCookies(id);
+            return json(res, 200, { ok: true, count: cookies.length, cookies });
+          }
+
+          if (method === 'POST' && action === 'cookies') {
+            const body = await readBody(req);
+            const input = body.cookies !== undefined ? body.cookies : body.text;
+            const r = await launcher.importCookies(id, input);
+            return json(res, 200, { ok: true, ...r });
           }
         }
 

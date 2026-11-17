@@ -200,9 +200,11 @@ function defaults(input = {}) {
     id: uid(),
     name: input.name || '新环境',
     group: String(input.group || '').trim(),
+    notes: '',
     startUrl: input.startUrl || 'about:blank',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    lastLaunchedAt: null,
 
     platform: base.platform,
     userAgentMode: 'auto', // auto = 用本机 Chrome 版本号拼装，custom = 手填

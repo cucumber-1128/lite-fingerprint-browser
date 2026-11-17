@@ -210,4 +210,95 @@ function readJsonArg(value) {
   }
 }
 
-module.exports = { PRESETS, getPreset, parseProxyLine, parseProxies, readJsonArg, countryToLocale, TIMEZONE_COORDS };
+/** 解析 JSON（EditThisCookie / CDP）或 Netscape 格式的 Cookie 文本 */
+function parseCookiesInput(input) {
+  let rawItems = [];
+  if (Array.isArray(input)) {
+    rawItems = input;
+  } else {
+    const s = String(input || '').trim();
+    if (!s) return [];
+    if (s.startsWith('[') || s.startsWith('{')) {
+      let parsed;
+      try {
+        parsed = JSON.parse(s);
+      } catch (e) {
+        throw new Error('Cookie JSON 格式错误：' + e.message);
+      }
+      rawItems = Array.isArray(parsed) ? parsed : parsed && Array.isArray(parsed.cookies) ? parsed.cookies : [];
+    } else {
+      for (const rawLine of s.split(/\r?\n/)) {
+        let line = rawLine.trim();
+        if (!line) continue;
+        let httpOnly = false;
+        if (line.startsWith('#HttpOnly_')) {
+          httpOnly = true;
+          line = line.slice('#HttpOnly_'.length);
+        } else if (line.startsWith('#')) {
+          continue;
+        }
+        const cols = line.split('\t');
+        if (cols.length < 7) continue;
+        rawItems.push({
+          domain: cols[0],
+          path: cols[2] || '/',
+          secure: /^true$/i.test(cols[3]),
+          httpOnly,
+          expires: Number(cols[4]) || 0,
+          name: cols[5],
+          value: cols.slice(6).join('\t'),
+        });
+      }
+    }
+  }
+
+  const out = [];
+  for (const c of rawItems) {
+    if (!c || typeof c !== 'object') continue;
+    const name = String(c.name || '').trim();
+    let domain = String(c.domain || '').trim();
+    if (!domain && c.url) {
+      try {
+        domain = new URL(String(c.url)).hostname;
+      } catch {
+        domain = '';
+      }
+    }
+    if (!name || !domain) continue;
+
+    const item = {
+      name,
+      value: String(c.value == null ? '' : c.value),
+      domain,
+      path: String(c.path || '/'),
+      secure: !!c.secure,
+      httpOnly: !!c.httpOnly,
+    };
+    const rawExp = c.expirationDate != null ? c.expirationDate : c.expires;
+    const exp = Number(rawExp);
+    if (isFinite(exp) && exp > 0) item.expires = exp;
+
+    const ss = String(c.sameSite || '').trim().toLowerCase();
+    if (ss === 'no_restriction' || ss === 'none') {
+      item.sameSite = 'None';
+      item.secure = true;
+    } else if (ss === 'lax') {
+      item.sameSite = 'Lax';
+    } else if (ss === 'strict') {
+      item.sameSite = 'Strict';
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+module.exports = {
+  PRESETS,
+  getPreset,
+  parseProxyLine,
+  parseProxies,
+  readJsonArg,
+  countryToLocale,
+  TIMEZONE_COORDS,
+  parseCookiesInput,
+};

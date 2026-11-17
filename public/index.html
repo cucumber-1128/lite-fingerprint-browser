@@ -21,12 +21,20 @@
     <input type="file" id="importFile" accept="application/json,.json" hidden />
     <button class="btn ghost" id="btnRefresh">刷新</button>
     <button class="btn ghost danger" id="btnQuit" title="关闭所有环境并退出控制台">退出</button>
+    <button class="btn" id="btnBatchNew">批量新建</button>
     <button class="btn primary" id="btnNew">+ 新建环境</button>
   </div>
 </header>
 
 <main>
   <section class="hint" id="hint"></section>
+  <section class="batch-bar" id="batchBar" hidden>
+    <label><input type="checkbox" id="chkSelectAll" /> 全选当前列表</label>
+    <span class="batch-count" id="batchCount">已选 0 个</span>
+    <button class="btn primary" id="btnBatchLaunch" disabled>批量启动</button>
+    <button class="btn" id="btnBatchStop" disabled>批量关闭</button>
+    <button class="btn danger" id="btnBatchDelete" disabled>批量删除</button>
+  </section>
   <section class="grid" id="grid"></section>
   <section class="empty" id="empty" hidden>
     <p>还没有环境。</p>
@@ -47,9 +55,14 @@
         <input name="group" placeholder="例如 美国-店铺" />
       </label>
     </div>
-    <label class="full">起始页
-      <input name="startUrl" placeholder="about:blank" />
-    </label>
+    <div class="row">
+      <label>起始页
+        <input name="startUrl" placeholder="about:blank" />
+      </label>
+      <label>备注
+        <input name="notes" placeholder="店铺名 / 账号用途 / 负责人" />
+      </label>
+    </div>
 
     <h3>指纹
       <button type="button" class="btn tiny" id="btnRandom">随机一套</button>
@@ -182,6 +195,64 @@
   <div id="proxyBody" class="report"></div>
   <footer>
     <button type="button" class="btn ghost" id="btnCloseProxy">关闭</button>
+  </footer>
+</dialog>
+
+<!-- 批量新建环境 -->
+<dialog id="batchDlg">
+  <form method="dialog" id="batchForm">
+    <h2>批量新建环境</h2>
+    <div class="row">
+      <label>地区预设
+        <select id="batchPreset">
+          <option value="">默认随机</option>
+        </select>
+      </label>
+      <label>名称前缀
+        <input id="batchName" placeholder="例如 美国店铺（自动加 -1 -2）" />
+      </label>
+    </div>
+    <div class="row">
+      <label>分组
+        <input id="batchGroup" placeholder="留空则默认使用预设名称" />
+      </label>
+      <label>数量
+        <input id="batchCountInput" type="number" min="1" max="100" placeholder="留空则等于代理条数" />
+      </label>
+    </div>
+    <label class="full">代理列表（每行一条，支持 http://u:p@h:p / socks5://... / h:p:u:p，与环境一对一）
+      <textarea id="batchProxies" rows="5" placeholder="留空表示全部直连&#10;http://user:pass@1.2.3.4:8080&#10;socks5://user:pass@5.6.7.8:1080"></textarea>
+    </label>
+    <div class="checks">
+      <label><input type="checkbox" id="batchAutoGeo" /> 启动时按代理出口自动同步时区 / 语言 / 经纬度</label>
+    </div>
+    <footer>
+      <span class="err" id="batchErr"></span>
+      <button type="button" class="btn ghost" id="btnCancelBatch">取消</button>
+      <button type="button" class="btn primary" id="btnSubmitBatch">创建</button>
+    </footer>
+  </form>
+</dialog>
+
+<!-- Cookie 导入导出 -->
+<dialog id="cookieDlg">
+  <h2 id="cookieTitle">Cookie 管理</h2>
+  <div class="row" style="margin-bottom: 12px; align-items: center;">
+    <span id="cookieInfo" style="color: var(--muted); font-size: 13px;">正在读取 Cookie…</span>
+    <div style="display: flex; gap: 8px; justify-content: flex-end;">
+      <button type="button" class="btn" id="btnCopyCookies">导出并复制 JSON</button>
+      <button type="button" class="btn" id="btnDownloadCookies">下载 Cookie JSON</button>
+    </div>
+  </div>
+  <label class="full">导入 Cookie（支持 EditThisCookie JSON 数组或 Netscape 格式文本）
+    <textarea id="cookieText" rows="7" placeholder="粘贴 JSON 数组（EditThisCookie）或 Netscape 格式文本…"></textarea>
+  </label>
+  <input type="file" id="cookieFile" accept=".json,.txt,application/json,text/plain" hidden />
+  <footer>
+    <button type="button" class="btn ghost" id="btnPickCookieFile">从文件读取</button>
+    <span class="err" id="cookieErr"></span>
+    <button type="button" class="btn ghost" id="btnCloseCookie">关闭</button>
+    <button type="button" class="btn primary" id="btnImportCookies">导入 Cookie</button>
   </footer>
 </dialog>
 
