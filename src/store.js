@@ -223,6 +223,8 @@ function defaults(input = {}) {
     fontNoise: true, // 字体列表：只在"声明平台 ≠ 真实平台"时生效
     webrtc: 'proxy', // proxy | disabled | real
     rectNoise: false,
+    autoGeo: false,
+    geo: null,
 
     proxy: { type: 'none', host: '', port: '', username: '', password: '' },
     seed: base.seed,

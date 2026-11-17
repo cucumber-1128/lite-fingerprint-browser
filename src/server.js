@@ -10,7 +10,7 @@ const launcher = require('./launch');
 const runtime = require('./runtime');
 const { testProxy } = require('./proxy');
 const { findBrowser } = require('./browser');
-const { PRESETS, parseProxyLine } = require('./cliutil');
+const { PRESETS, parseProxyLine, countryToLocale } = require('./cliutil');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -174,6 +174,37 @@ function createServer(opts = {}) {
           }
         }
 
+        if (method === 'POST' && pathname === '/api/proxy-check') {
+          const body = await readBody(req);
+          const px = (body && body.proxy) || {};
+          if (!px.type || px.type === 'none' || !px.host || !px.port) {
+            return json(res, 400, { error: '请先填写代理类型、主机和端口' });
+          }
+          let password = px.password || '';
+          if (!password && body.profileId) {
+            const existing = store.get(body.profileId);
+            if (
+              existing &&
+              existing.proxy &&
+              existing.proxy.host === px.host &&
+              String(existing.proxy.port) === String(px.port)
+            ) {
+              password = existing.proxy.password || '';
+            }
+          }
+          const result = await testProxy({
+            type: px.type,
+            host: px.host,
+            port: px.port,
+            username: px.username || '',
+            password,
+          });
+          return json(res, 200, {
+            ...result,
+            suggestedLocale: result.ok ? countryToLocale(result.countryCode) : null,
+          });
+        }
+
         if (method === 'POST' && pathname === '/api/shutdown') {
           json(res, 200, { ok: true });
           // 先把响应发出去，再关环境退出；不然页面会看到连接被掐断
@@ -249,7 +280,10 @@ function createServer(opts = {}) {
 
           if (method === 'POST' && action === 'launch') {
             const body = await readBody(req);
-            const info = await launcher.launch(id, { startUrl: body.startUrl });
+            const info = await launcher.launch(id, {
+              startUrl: body.startUrl,
+              autoGeo: body.autoGeo === true,
+            });
             return json(res, 200, info);
           }
 
@@ -284,6 +318,11 @@ function createServer(opts = {}) {
               password: px.password,
             });
             return json(res, 200, result);
+          }
+
+          if (method === 'POST' && action === 'sync-geo') {
+            const { profile, proxy } = await launcher.syncProfileGeoFromProxy(id);
+            return json(res, 200, { ok: true, profile: withRunning(profile), proxy });
           }
         }
 

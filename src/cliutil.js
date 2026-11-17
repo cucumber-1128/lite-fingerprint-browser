@@ -94,7 +94,7 @@ function parseProxyLine(line) {
   if (url) {
     const scheme = url[1].toLowerCase();
     return {
-      type: scheme === 'socks5' ? 'socks5' : 'http',
+      type: scheme === 'socks5' ? 'socks5' : scheme === 'https' ? 'https' : 'http',
       host: url[4],
       port: url[5],
       username: url[2] || '',
@@ -110,8 +110,9 @@ function parseProxyLine(line) {
     return { type: 'http', host: parts[0], port: parts[1], username: parts[2], password: parts[3] };
   }
   if (parts.length === 5) {
+    const scheme = parts[0].toLowerCase();
     return {
-      type: parts[0].toLowerCase() === 'socks5' ? 'socks5' : 'http',
+      type: scheme === 'socks5' ? 'socks5' : scheme === 'https' ? 'https' : 'http',
       host: parts[1],
       port: parts[2],
       username: parts[3],
@@ -120,6 +121,73 @@ function parseProxyLine(line) {
   }
   throw new Error('看不懂的代理格式：' + s + '（建议用 http://user:pass@host:port）');
 }
+
+const COUNTRY_LOCALES = {
+  US: { locale: 'en-US', languages: ['en-US', 'en'] },
+  GB: { locale: 'en-GB', languages: ['en-GB', 'en'] },
+  UK: { locale: 'en-GB', languages: ['en-GB', 'en'] },
+  AU: { locale: 'en-AU', languages: ['en-AU', 'en-US', 'en'] },
+  CA: { locale: 'en-CA', languages: ['en-CA', 'en-US', 'en'] },
+  SG: { locale: 'en-SG', languages: ['en-SG', 'en-US', 'en'] },
+  DE: { locale: 'de-DE', languages: ['de-DE', 'de', 'en-US', 'en'] },
+  AT: { locale: 'de-AT', languages: ['de-AT', 'de', 'en-US', 'en'] },
+  CH: { locale: 'de-CH', languages: ['de-CH', 'de', 'en-US', 'en'] },
+  FR: { locale: 'fr-FR', languages: ['fr-FR', 'fr', 'en-US', 'en'] },
+  ES: { locale: 'es-ES', languages: ['es-ES', 'es', 'en-US', 'en'] },
+  MX: { locale: 'es-MX', languages: ['es-MX', 'es', 'en-US', 'en'] },
+  IT: { locale: 'it-IT', languages: ['it-IT', 'it', 'en-US', 'en'] },
+  PT: { locale: 'pt-PT', languages: ['pt-PT', 'pt', 'en-US', 'en'] },
+  BR: { locale: 'pt-BR', languages: ['pt-BR', 'pt', 'en-US', 'en'] },
+  NL: { locale: 'nl-NL', languages: ['nl-NL', 'nl', 'en-US', 'en'] },
+  RU: { locale: 'ru-RU', languages: ['ru-RU', 'ru', 'en-US', 'en'] },
+  JP: { locale: 'ja-JP', languages: ['ja-JP', 'ja', 'en-US', 'en'] },
+  KR: { locale: 'ko-KR', languages: ['ko-KR', 'ko', 'en-US', 'en'] },
+  TW: { locale: 'zh-TW', languages: ['zh-TW', 'zh', 'en-US', 'en'] },
+  HK: { locale: 'zh-HK', languages: ['zh-HK', 'zh', 'en-US', 'en'] },
+  CN: { locale: 'zh-CN', languages: ['zh-CN', 'zh', 'en-US', 'en'] },
+  VN: { locale: 'vi-VN', languages: ['vi-VN', 'vi', 'en-US', 'en'] },
+  TH: { locale: 'th-TH', languages: ['th-TH', 'th', 'en-US', 'en'] },
+  ID: { locale: 'id-ID', languages: ['id-ID', 'id', 'en-US', 'en'] },
+  MY: { locale: 'ms-MY', languages: ['ms-MY', 'ms', 'en-US', 'en'] },
+};
+
+function countryToLocale(countryCode) {
+  const key = String(countryCode || '').trim().toUpperCase();
+  const entry = COUNTRY_LOCALES[key] || COUNTRY_LOCALES.US;
+  return { locale: entry.locale, languages: [...entry.languages] };
+}
+
+const TIMEZONE_COORDS = {
+  'America/New_York': { lat: 40.7128, lon: -74.006 },
+  'America/Los_Angeles': { lat: 34.0522, lon: -118.2437 },
+  'America/Chicago': { lat: 41.8781, lon: -87.6298 },
+  'America/Denver': { lat: 39.7392, lon: -104.9903 },
+  'America/Toronto': { lat: 43.6532, lon: -79.3832 },
+  'America/Vancouver': { lat: 49.2827, lon: -123.1207 },
+  'America/Mexico_City': { lat: 19.4326, lon: -99.1332 },
+  'America/Sao_Paulo': { lat: -23.5505, lon: -46.6333 },
+  'Europe/London': { lat: 51.5074, lon: -0.1278 },
+  'Europe/Berlin': { lat: 52.52, lon: 13.405 },
+  'Europe/Paris': { lat: 48.8566, lon: 2.3522 },
+  'Europe/Madrid': { lat: 40.4168, lon: -3.7038 },
+  'Europe/Rome': { lat: 41.9028, lon: 12.4964 },
+  'Europe/Amsterdam': { lat: 52.3676, lon: 4.9041 },
+  'Europe/Zurich': { lat: 47.3769, lon: 8.5417 },
+  'Europe/Vienna': { lat: 48.2082, lon: 16.3738 },
+  'Europe/Moscow': { lat: 55.7558, lon: 37.6173 },
+  'Asia/Tokyo': { lat: 35.6762, lon: 139.6503 },
+  'Asia/Seoul': { lat: 37.5665, lon: 126.978 },
+  'Asia/Taipei': { lat: 25.033, lon: 121.5654 },
+  'Asia/Hong_Kong': { lat: 22.3193, lon: 114.1694 },
+  'Asia/Shanghai': { lat: 31.2304, lon: 121.4737 },
+  'Asia/Singapore': { lat: 1.3521, lon: 103.8198 },
+  'Asia/Bangkok': { lat: 13.7563, lon: 100.5018 },
+  'Asia/Ho_Chi_Minh': { lat: 10.8231, lon: 106.6297 },
+  'Asia/Jakarta': { lat: -6.2088, lon: 106.8456 },
+  'Asia/Kuala_Lumpur': { lat: 3.139, lon: 101.6869 },
+  'Australia/Sydney': { lat: -33.8688, lon: 151.2093 },
+  'Australia/Melbourne': { lat: -37.8136, lon: 144.9631 },
+};
 
 function parseProxies(text) {
   const out = [];
@@ -142,4 +210,4 @@ function readJsonArg(value) {
   }
 }
 
-module.exports = { PRESETS, getPreset, parseProxyLine, parseProxies, readJsonArg };
+module.exports = { PRESETS, getPreset, parseProxyLine, parseProxies, readJsonArg, countryToLocale, TIMEZONE_COORDS };

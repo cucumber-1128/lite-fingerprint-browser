@@ -131,7 +131,9 @@
       <label><input type="checkbox" name="rectNoise" /> 元素坐标噪声（进阶，可能影响布局判断）</label>
     </div>
 
-    <h3>代理</h3>
+    <h3>代理
+      <button type="button" class="btn tiny" id="btnSyncGeo">测代理并对齐地区</button>
+    </h3>
     <label class="full">一键识别代理串（可选，粘贴后自动拆分）
       <input id="proxyQuick" placeholder="如 socks5://user:pass@1.2.3.4:1080 或 host:port:user:pass" autocomplete="off" />
     </label>
@@ -139,7 +141,8 @@
       <label>类型
         <select name="proxyType">
           <option value="none">不使用</option>
-          <option value="http">HTTP / HTTPS</option>
+          <option value="http">HTTP 代理</option>
+          <option value="https">HTTPS 代理</option>
           <option value="socks5">SOCKS5</option>
         </select>
       </label>
@@ -151,6 +154,9 @@
       <label>端口<input name="proxyPort" placeholder="7890" /></label>
       <label>用户名<input name="proxyUsername" autocomplete="off" /></label>
       <label>密码<input name="proxyPassword" type="password" autocomplete="new-password" /></label>
+    </div>
+    <div class="checks">
+      <label><input type="checkbox" name="autoGeo" /> 启动时按代理出口自动同步时区 / 语言 / 经纬度</label>
     </div>
 
     <footer>

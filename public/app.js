@@ -3,6 +3,7 @@
 let state = { profiles: [], browserPath: '', timezones: {}, presets: [], webglPool: [], screenPool: [] };
 let editingId = null;
 let lastAutoAvail = 1040;
+let pendingGeo = undefined;
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) =>
@@ -181,6 +182,7 @@ function getVal(name) {
 
 function openEditor(profile) {
   editingId = profile ? profile.id : null;
+  pendingGeo = undefined;
   $('#editorTitle').textContent = profile ? '编辑环境' : '新建环境';
   $('#editorErr').textContent = '';
 
@@ -224,6 +226,7 @@ function openEditor(profile) {
     setVal('proxyHost', px.host);
     setVal('proxyPort', px.port);
     setVal('proxyUsername', px.username);
+    setVal('autoGeo', profile.autoGeo === true);
     pwInput.placeholder = px.hasPassword ? '已保存，留空表示不修改' : '';
   } else {
     setVal('name', '');
@@ -256,6 +259,7 @@ function openEditor(profile) {
     setVal('proxyPort', '');
     setVal('proxyUsername', '');
     setVal('proxyPassword', '');
+    setVal('autoGeo', false);
   }
   lastAutoAvail = (Number(getVal('screenHeight')) || 1080) - (getVal('platform') === 'mac' ? 25 : 40);
   syncUaWrap();
@@ -309,6 +313,8 @@ function readEditor() {
     textNoise: getVal('textNoise'),
     fontNoise: getVal('fontNoise'),
     rectNoise: getVal('rectNoise'),
+    autoGeo: getVal('autoGeo'),
+    ...(pendingGeo !== undefined ? { geo: pendingGeo } : {}),
     proxy,
   };
 }
@@ -472,6 +478,10 @@ function showProxyResult(r) {
     add('结果', '可用');
     add('出口 IP', r.ip || '(未获取)');
     add('国家 / 城市', [r.country, r.city].filter(Boolean).join(' / ') || '-');
+    add('出口时区', r.timezone || '-');
+    if (typeof r.lat === 'number' && typeof r.lon === 'number') {
+      add('坐标', r.lat + ', ' + r.lon);
+    }
     add('运营商', r.isp || '-');
     add('耗时', (r.ms || 0) + ' ms');
     if (r.directIp) {
@@ -674,6 +684,45 @@ async function parseQuickProxy() {
 
 $('#proxyQuick').addEventListener('change', parseQuickProxy);
 $('#proxyQuick').addEventListener('paste', () => setTimeout(parseQuickProxy, 0));
+
+$('#btnSyncGeo').addEventListener('click', async () => {
+  const btn = $('#btnSyncGeo');
+  const px = readEditor().proxy;
+  if (!px || px.type === 'none' || !px.host || !px.port) {
+    $('#editorErr').textContent = '请先填写代理类型、主机和端口';
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = '检测中…';
+  $('#editorErr').textContent = '';
+  try {
+    const r = await api('/api/proxy-check', {
+      method: 'POST',
+      body: { profileId: editingId, proxy: px },
+    });
+    if (!r.ok) {
+      $('#editorErr').textContent = r.error || '代理不可用';
+      return;
+    }
+    if (r.timezone) setVal('timezone', r.timezone);
+    if (r.suggestedLocale) {
+      setVal('locale', r.suggestedLocale.locale);
+      setVal('languages', r.suggestedLocale.languages.join(','));
+    }
+    pendingGeo =
+      typeof r.lat === 'number' && typeof r.lon === 'number'
+        ? { lat: r.lat, lon: r.lon, ip: r.ip }
+        : r.ip
+          ? { ip: r.ip }
+          : undefined;
+    toast('已对齐出口 ' + r.ip + '（' + [r.countryCode || r.country, r.timezone].filter(Boolean).join(' · ') + '）');
+  } catch (err) {
+    $('#editorErr').textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '测代理并对齐地区';
+  }
+});
 
 (async function init() {
   await load();

@@ -1005,35 +1005,72 @@
 
   if (IS_WINDOW && CFG.webrtc && CFG.webrtc !== 'real') {
     var FAKE_IP = CFG.fakeIp || '192.168.1.88';
+    var PUBLIC_IP = String(CFG.publicIp || '');
     var DISABLED = CFG.webrtc === 'disabled';
     var IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
+
+    function isIPv6Token(tok) {
+      return typeof tok === 'string' && tok.indexOf(':') >= 0 && /^[0-9a-f:.%]+$/i.test(tok);
+    }
+
+    function rewriteCandidateTokenList(str, forSdp) {
+      var tokens = String(str).split(' ');
+      if (tokens.length >= 6 && isIPv6Token(tokens[4])) {
+        if (forSdp) return null;
+        tokens[4] = FAKE_IP;
+      }
+      var isSrflx = PUBLIC_IP && /\btyp\s+srflx\b/i.test(str);
+      var replacedPrimary = false;
+      for (var ti = 0; ti < tokens.length; ti++) {
+        var tk = tokens[ti];
+        if (!tk) continue;
+        if (isIPv6Token(tk)) {
+          tokens[ti] = FAKE_IP;
+          continue;
+        }
+        if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(tk)) {
+          if (isSrflx && !replacedPrimary && ti === 4) {
+            tokens[ti] = PUBLIC_IP;
+            replacedPrimary = true;
+          } else {
+            tokens[ti] = FAKE_IP;
+          }
+        }
+      }
+      return tokens.join(' ');
+    }
 
     // 只改 a=candidate 行。SDP 里 o= / c= 那两行真 Chrome 自己写的就是 127.0.0.1 / 0.0.0.0，
     // 一起替换反而制造出一个真机不会出现的本地地址。
     function cleanSdp(sdp) {
       if (!sdp || sdp.indexOf('candidate') < 0) return sdp;
-      var out = sdp;
-      if (DISABLED) {
-        out = out
-          .split('\r\n')
-          .filter(function (line) {
-            return line.indexOf('a=candidate') !== 0;
-          })
-          .join('\r\n');
+      var lines = String(sdp).split('\r\n');
+      var out = [];
+      for (var li = 0; li < lines.length; li++) {
+        var line = lines[li];
+        if (line.indexOf('a=candidate:') === 0) {
+          if (DISABLED) continue;
+          var cleaned = rewriteCandidateTokenList(line, true);
+          if (cleaned === null) continue;
+          out.push(cleaned);
+        } else {
+          out.push(line);
+        }
       }
-      try {
-        out = out.replace(/a=candidate:[^\r\n]*/g, function (line) {
-          return line.replace(IPV4, FAKE_IP);
-        });
-      } catch (e) {
-        /* ignore */
-      }
-      return out;
+      return out.join('\r\n');
     }
 
     function cleanCandidate(cand) {
       try {
-        return String(cand == null ? '' : cand).replace(IPV4, FAKE_IP);
+        if (cand == null) return cand;
+        var s = String(cand);
+        if (!s) return s;
+        if (s.indexOf('candidate:') !== 0 && s.indexOf('a=candidate:') !== 0) {
+          return s.replace(IPV4, FAKE_IP);
+        }
+        return rewriteCandidateTokenList(s, false).replace(IPV4, function (m) {
+          return PUBLIC_IP && m === PUBLIC_IP ? PUBLIC_IP : FAKE_IP;
+        });
       } catch (e) {
         return cand;
       }

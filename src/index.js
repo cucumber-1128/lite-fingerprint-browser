@@ -262,6 +262,7 @@ async function cmdCreate() {
     fields.name = count > 1 ? baseName + '-' + (i + 1) : baseName;
     fields.group = fields.group || group;
     if (proxies[i]) fields.proxy = proxies[i];
+    if (hasFlag('auto-geo')) fields.autoGeo = true;
     created.push(store.publicProfile(store.create(fields)));
   }
 
@@ -325,6 +326,7 @@ function resolveTargets() {
 async function cmdLaunch() {
   const ids = resolveTargets();
   if (!ids.length) return fail('没有匹配的环境（用 ID、--group <分组> 或 --all）');
+  const autoGeo = hasFlag('auto-geo');
   const live = await ensureDaemon();
   const results = [];
   for (const id of ids) {
@@ -333,7 +335,7 @@ async function cmdLaunch() {
         live,
         'POST',
         '/api/profiles/' + encodeURIComponent(id) + '/launch',
-        {},
+        { autoGeo },
         35000
       );
       results.push({

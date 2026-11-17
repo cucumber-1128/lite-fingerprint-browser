@@ -5,6 +5,8 @@
  * 会真的启动两个 Chrome 环境、读回指纹、做断言，最后全部关掉。
  */
 const net = require('node:net');
+const tls = require('node:tls');
+const crypto = require('node:crypto');
 const http = require('node:http');
 const path = require('node:path');
 const os = require('node:os');
@@ -145,6 +147,20 @@ function staticChecks() {
     store.normalizeScreen({ width: 1920, height: 1080, availHeight: 728 }, 'win').availHeight,
     1040,
     'normalizeScreen 自动修复异常小的 availHeight'
+  );
+  const pxHttps = cliutil.parseProxyLine('https://u:p@1.2.3.4:443');
+  ok(pxHttps && pxHttps.type === 'https' && pxHttps.port === '443', '代理串解析：https 保留 https 类型');
+  const nyGeo = launcher.resolveGeolocation({ timezone: 'America/New_York', seed: 's1' });
+  const jpGeo = launcher.resolveGeolocation({ timezone: 'Asia/Tokyo', seed: 's1' });
+  ok(
+    nyGeo && Math.abs(nyGeo.latitude - 40.7128) < 0.05 && Math.abs(nyGeo.longitude - -74.006) < 0.05,
+    'resolveGeolocation 按纽约时区计算确定性经纬度',
+    nyGeo
+  );
+  ok(
+    jpGeo && Math.abs(jpGeo.latitude - 35.6762) < 0.05 && Math.abs(jpGeo.longitude - 139.6503) < 0.05,
+    'resolveGeolocation 按东京时区计算确定性经纬度',
+    jpGeo
   );
 }
 
@@ -404,6 +420,147 @@ function testSocks5Relay() {
   });
 }
 
+/* ------------------------- 2c. HTTPS 上游中继自检 ------------------------- */
+
+function selfSignedCert() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const derLen = (n) =>
+    n < 128 ? Buffer.from([n]) : n < 256 ? Buffer.from([0x81, n]) : Buffer.from([0x82, n >> 8, n & 0xff]);
+  const tag = (t, b) => Buffer.concat([Buffer.from([t]), derLen(b.length), b]);
+  const seq = (...a) => tag(0x30, Buffer.concat(a));
+  const set = (...a) => tag(0x31, Buffer.concat(a));
+  const oid = (bytes) => tag(0x06, Buffer.from(bytes));
+  const alg = seq(oid([0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b]), Buffer.from([0x05, 0x00]));
+  const cn = seq(set(seq(oid([0x55, 0x04, 0x03]), tag(0x0c, Buffer.from('127.0.0.1')))));
+  const spki = publicKey.export({ type: 'spki', format: 'der' });
+  const tbs = seq(
+    tag(0xa0, Buffer.from([2, 1, 2])),
+    Buffer.from([2, 1, 1]),
+    alg,
+    cn,
+    seq(tag(0x17, Buffer.from('250101000000Z')), tag(0x17, Buffer.from('350101000000Z'))),
+    cn,
+    spki
+  );
+  const sig = crypto.sign('sha256', tbs, privateKey);
+  const certDer = seq(tbs, alg, tag(0x03, Buffer.concat([Buffer.from([0]), sig])));
+  return {
+    cert:
+      '-----BEGIN CERTIFICATE-----\n' +
+      certDer.toString('base64').match(/.{1,64}/g).join('\n') +
+      '\n-----END CERTIFICATE-----\n',
+    key: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+  };
+}
+
+function testHttpsRelay() {
+  return new Promise((resolve) => {
+    console.log('\n[2c] 代理中继（HTTPS 上游，TLS 隧道 + 认证）');
+    const echo = net.createServer((s) => s.pipe(s));
+    echo.listen(0, '127.0.0.1', async () => {
+      const echoPort = echo.address().port;
+      const upstream = tls.createServer(selfSignedCert(), (socket) => {
+        let buf = '';
+        const onData = (c) => {
+          buf += c.toString('latin1');
+          const idx = buf.indexOf('\r\n\r\n');
+          if (idx < 0) return;
+          socket.removeListener('data', onData);
+          const head = buf.slice(0, idx);
+          const lines = head.split('\r\n');
+          const expect = 'Basic ' + Buffer.from('user:pass').toString('base64');
+          const authOk = lines.some((l) => l.toLowerCase() === ('proxy-authorization: ' + expect).toLowerCase());
+          if (!authOk) {
+            socket.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n');
+            return;
+          }
+          const m = /^CONNECT\s+([^:]+):(\d+)/i.exec(lines[0] || '');
+          if (!m) {
+            socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+            return;
+          }
+          const up = net.connect(Number(m[2]), m[1], () => {
+            socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+            const rest = buf.slice(idx + 4);
+            if (rest) up.write(rest, 'latin1');
+            up.pipe(socket);
+            socket.pipe(up);
+          });
+          up.on('error', () => socket.destroy());
+        };
+        socket.on('data', onData);
+        socket.on('error', () => {});
+      });
+      upstream.listen(0, '127.0.0.1', async () => {
+        const upPort = upstream.address().port;
+        const tunnel = (relayPort) =>
+          new Promise((res) => {
+            const sock = net.connect(relayPort, '127.0.0.1', () => {
+              sock.write('CONNECT 127.0.0.1:' + echoPort + ' HTTP/1.1\r\nHost: 127.0.0.1:' + echoPort + '\r\n\r\n');
+            });
+            let buf = Buffer.alloc(0);
+            let tunneled = false;
+            const timer = setTimeout(() => res({ ok: false, reason: '超时' }), 5000);
+            sock.on('data', (c) => {
+              buf = Buffer.concat([buf, c]);
+              if (!tunneled) {
+                const idx = buf.indexOf('\r\n\r\n');
+                if (idx < 0) return;
+                const head = buf.subarray(0, idx).toString('latin1');
+                tunneled = true;
+                if (!/ 200 /.test(head.split('\r\n')[0])) {
+                  clearTimeout(timer);
+                  sock.destroy();
+                  return res({ ok: false, reason: head.split('\r\n')[0] });
+                }
+                buf = buf.subarray(idx + 4);
+                sock.write('ping-https-proxy');
+              }
+              if (tunneled && buf.includes(Buffer.from('ping-https-proxy'))) {
+                clearTimeout(timer);
+                sock.destroy();
+                res({ ok: true });
+              }
+            });
+            sock.on('error', () => {
+              clearTimeout(timer);
+              res({ ok: false, reason: 'socket error' });
+            });
+          });
+        try {
+          const relay = await createRelay({
+            type: 'https',
+            host: '127.0.0.1',
+            port: upPort,
+            username: 'user',
+            password: 'pass',
+            rejectUnauthorized: false,
+          });
+          ok((await tunnel(relay.port)).ok, 'HTTPS 上游代理：TLS 握手 + Basic 认证 + 隧道透传成功');
+          await relay.close();
+
+          const bad = await createRelay({
+            type: 'https',
+            host: '127.0.0.1',
+            port: upPort,
+            username: 'user',
+            password: 'wrong',
+            rejectUnauthorized: false,
+          });
+          ok(!(await tunnel(bad.port)).ok, 'HTTPS 上游代理：密码错误被拒绝');
+          await bad.close();
+        } catch (e) {
+          ok(false, 'HTTPS 上游代理测试异常: ' + e.message);
+        } finally {
+          upstream.close();
+          echo.close();
+          resolve();
+        }
+      });
+    });
+  });
+}
+
 /* --------------------------- 3. 真实环境指纹自检 --------------------------- */
 
 async function browserChecks() {
@@ -422,6 +579,7 @@ async function browserChecks() {
     webglVendor: 'Google Inc. (AMD)',
     webglRenderer: 'ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)',
     webrtc: 'proxy',
+    geo: { lat: 40.7128, lon: -74.006, ip: '45.67.89.10' },
     seed: 'aaaa1111',
   });
   const b = store.create({
@@ -536,6 +694,26 @@ async function browserChecks() {
           if (sd[i] !== 0x12 || sd[i + 1] !== 0x34 || sd[i + 2] !== 0x56) solidCorrupted++;
         }
 
+        // 4) WebRTC IPv6 候选脱敏与 srflx 公网 IP 改写
+        const fakeSdp = [
+          'v=0',
+          'a=candidate:1 1 udp 2122260223 10.0.0.5 54321 typ host generation 0',
+          'a=candidate:2 1 udp 2122262783 240e:390:123:456::1 54322 typ host generation 0',
+          'a=candidate:3 1 udp 1686052607 203.0.113.99 54323 typ srflx raddr 10.0.0.5 rport 54321',
+          ''
+        ].join('\\r\\n');
+        const desc = new RTCSessionDescription({ type: 'offer', sdp: fakeSdp });
+        const cand6 = new RTCIceCandidate({
+          candidate: 'candidate:2 1 udp 2122262783 240e:390:123:456::1 54322 typ host',
+          sdpMid: '0',
+          sdpMLineIndex: 0
+        });
+        const candSrflx = new RTCIceCandidate({
+          candidate: 'candidate:3 1 udp 1686052607 203.0.113.99 54323 typ srflx raddr 10.0.0.5 rport 54321',
+          sdpMid: '0',
+          sdpMLineIndex: 0
+        });
+
         return JSON.stringify({
           hcGetterHasProto: hcDesc && hcDesc.get ? ('prototype' in hcDesc.get) : null,
           hcGetterName: hcDesc && hcDesc.get ? hcDesc.get.name : null,
@@ -553,7 +731,10 @@ async function browserChecks() {
           reverseToStrAfterRemove,
           hcGetterThrows,
           nullCallStack,
-          solidCorrupted
+          solidCorrupted,
+          sdpOut: desc.sdp,
+          cand6Out: cand6.candidate,
+          candSrflxJson: candSrflx.toJSON().candidate
         });
       })()`
     );
@@ -598,6 +779,17 @@ async function browserChecks() {
       audit.nullCallStack
     );
     eq(audit.solidCorrupted, 0, 'Canvas 纯色块无像素被扰动（免疫 Solid-Fill 陷阱）');
+    ok(
+      !audit.sdpOut.includes('240e:390') && !audit.sdpOut.includes('10.0.0.5') && audit.sdpOut.includes('45.67.89.10'),
+      'WebRTC SDP 已过滤 IPv6 候选、替换真实内网 IP 且将 srflx 映射为代理出口 IP',
+      audit.sdpOut
+    );
+    ok(!audit.cand6Out.includes('240e:390'), 'RTCIceCandidate IPv6 候选已被脱敏', audit.cand6Out);
+    ok(
+      audit.candSrflxJson.includes('45.67.89.10') && !audit.candSrflxJson.includes('203.0.113.99'),
+      'RTCIceCandidate.toJSON() 已同步改写 srflx 公网地址',
+      audit.candSrflxJson
+    );
 
     // 第二个环境：指纹必须完全不同
     t0 = Date.now();
@@ -882,6 +1074,7 @@ async function cliDaemonChecks() {
   staticChecks();
   await testRelay();
   await testSocks5Relay();
+  await testHttpsRelay();
   await browserChecks();
   await headerChecks();
   await cliDaemonChecks();

@@ -118,24 +118,59 @@ function expandIPv6(ip) {
   return out;
 }
 
-/* ------------------------------ HTTP 上游隧道 ------------------------------ */
+/* ------------------------------ HTTP/HTTPS 上游隧道 ------------------------------ */
+
+function connectUpstreamSocket(upstream, onConnect) {
+  if (upstream.type === 'https') {
+    const tlsOpts = {
+      host: upstream.host,
+      port: Number(upstream.port),
+      rejectUnauthorized: upstream.rejectUnauthorized !== false,
+    };
+    if (!net.isIP(upstream.host)) tlsOpts.servername = upstream.host;
+    return tls.connect(tlsOpts, onConnect);
+  }
+  return net.connect({ host: upstream.host, port: Number(upstream.port) }, onConnect);
+}
+
+function wireTunnel(sock, clientSocket) {
+  try {
+    sock.setNoDelay(true);
+    clientSocket.setNoDelay(true);
+  } catch {
+    /* ignore */
+  }
+  const IDLE_MS = 600000;
+  sock.setTimeout(IDLE_MS, () => {
+    sock.destroy();
+    clientSocket.destroy();
+  });
+  clientSocket.setTimeout(IDLE_MS, () => {
+    clientSocket.destroy();
+    sock.destroy();
+  });
+  sock.pipe(clientSocket);
+  clientSocket.pipe(sock);
+  sock.on('error', () => clientSocket.destroy());
+  clientSocket.on('error', () => sock.destroy());
+  clientSocket.on('close', () => sock.destroy());
+  sock.on('close', () => clientSocket.destroy());
+}
 
 function httpProxyConnect(upstream, targetHost, targetPort) {
   return new Promise((resolve, reject) => {
-    const sock = net.connect({ host: upstream.host, port: upstream.port });
+    let sock = null;
     let buf = Buffer.alloc(0);
     let settled = false;
 
     const fail = (msg) => {
       if (settled) return;
       settled = true;
-      sock.destroy();
+      if (sock) sock.destroy();
       reject(new Error(msg));
     };
 
-    sock.setTimeout(20000, () => fail('HTTP 上游代理超时'));
-    sock.on('error', (e) => fail('HTTP 上游代理错误：' + e.message));
-    sock.on('connect', () => {
+    sock = connectUpstreamSocket(upstream, () => {
       const hostPort = targetHost + ':' + targetPort;
       const lines = ['CONNECT ' + hostPort + ' HTTP/1.1', 'Host: ' + hostPort];
       if (upstream.username) {
@@ -144,6 +179,9 @@ function httpProxyConnect(upstream, targetHost, targetPort) {
       lines.push('', '');
       sock.write(lines.join('\r\n'));
     });
+
+    sock.setTimeout(20000, () => fail('HTTP 上游代理超时'));
+    sock.on('error', (e) => fail('HTTP 上游代理错误：' + e.message));
 
     function onData(chunk) {
       buf = Buffer.concat([buf, chunk]);
@@ -175,15 +213,17 @@ function httpProxyConnect(upstream, targetHost, targetPort) {
 /* -------------------------------- 中继本体 -------------------------------- */
 
 /**
- * @param {{type:'http'|'socks5', host:string, port:number, username?:string, password?:string}} upstream
+ * @param {{type:'http'|'https'|'socks5', host:string, port:number, username?:string, password?:string, rejectUnauthorized?:boolean}} upstream
  * @returns {Promise<{port:number, close:()=>Promise<void>}>}
  */
 async function createRelay(upstream, opts = {}) {
   const up = {
+    type: upstream.type || 'http',
     host: String(upstream.host || '').trim(),
     port: Number(upstream.port),
     username: upstream.username || '',
     password: upstream.password || '',
+    rejectUnauthorized: upstream.rejectUnauthorized,
   };
   if (!up.host || !up.port) throw new Error('代理配置缺少 host/port');
 
@@ -223,10 +263,7 @@ async function createRelay(upstream, opts = {}) {
     const pipe = (sock, absolute) => {
       sock.write(upgradeHead(req, url, absolute));
       if (head && head.length) sock.write(head);
-      sock.pipe(clientSocket);
-      clientSocket.pipe(sock);
-      sock.on('error', () => clientSocket.destroy());
-      clientSocket.on('error', () => sock.destroy());
+      wireTunnel(sock, clientSocket);
     };
 
     if (upstream.type === 'socks5') {
@@ -241,7 +278,7 @@ async function createRelay(upstream, opts = {}) {
           server.emit('relay-error', e);
         });
     } else {
-      const sock = net.connect(up.port, up.host, () => pipe(sock, true));
+      const sock = connectUpstreamSocket(up, () => pipe(sock, true));
       sock.on('error', (e) => {
         try {
           clientSocket.destroy();
@@ -266,11 +303,7 @@ async function createRelay(upstream, opts = {}) {
       const sock = await dial(host, port);
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head && head.length) sock.write(head);
-      sock.pipe(clientSocket);
-      clientSocket.pipe(sock);
-      sock.on('error', () => clientSocket.destroy());
-      clientSocket.on('close', () => sock.destroy());
-      sock.on('close', () => clientSocket.destroy());
+      wireTunnel(sock, clientSocket);
     } catch (e) {
       try {
         clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
@@ -328,13 +361,19 @@ async function createRelay(upstream, opts = {}) {
         .catch((e) => finish(e));
     } else {
       headers['proxy-authorization'] = basicAuth(up.username, up.password);
-      const r = http.request({
+      const client = up.type === 'https' ? https : http;
+      const reqOpts = {
         host: up.host,
         port: up.port,
         method: req.method,
         path: req.url,
         headers,
-      });
+      };
+      if (up.type === 'https') {
+        if (!net.isIP(up.host)) reqOpts.servername = up.host;
+        reqOpts.rejectUnauthorized = up.rejectUnauthorized !== false;
+      }
+      const r = client.request(reqOpts);
       finish(null, r);
     }
   });
@@ -493,7 +532,7 @@ async function testProxy(upstream, opts = {}) {
       // 接口能连上但没给 ip（多半是限流）：换一个接口再试；
       // 连不上就直接失败，不再多等一个超时
       const second = await fetchJson(
-        'http://ip-api.com/json/?fields=status,country,regionName,city,isp,query',
+        'http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,isp,timezone,lat,lon,query',
         relay.port,
         timeoutMs
       );
@@ -512,12 +551,26 @@ async function testProxy(upstream, opts = {}) {
   if (error) return { ok: false, error: error.message, ms: Date.now() - started };
   const d = data || {};
   const ip = d.ip || d.query || '';
+  let lat = typeof d.lat === 'number' ? d.lat : null;
+  let lon = typeof d.lon === 'number' ? d.lon : null;
+  if ((lat === null || lon === null) && typeof d.loc === 'string' && d.loc.includes(',')) {
+    const [la, lo] = d.loc.split(',').map(Number);
+    if (isFinite(la) && isFinite(lo)) {
+      lat = la;
+      lon = lo;
+    }
+  }
+  const countryCode = String(d.countryCode || (d.country && d.country.length === 2 ? d.country : '')).toUpperCase();
   const result = {
     ok: !!ip,
     ip,
     country: d.country || '',
+    countryCode,
     city: d.city || d.regionName || '',
     isp: d.isp || d.org || '',
+    timezone: d.timezone || '',
+    lat,
+    lon,
     ms: Date.now() - started,
     directIp: '',
     leaked: false,
@@ -525,7 +578,7 @@ async function testProxy(upstream, opts = {}) {
 
   // 直连再取一次：如果出口 IP 和直连一样，说明代理其实没生效
   try {
-    const direct = await fetchJson('https://ipinfo.io/json', 0, Math.min(timeoutMs, 5000));
+    const direct = await fetchJson('https://ipinfo.io/json', 0, Math.min(timeoutMs, 2500));
     result.directIp = (direct && direct.json && direct.json.ip) || '';
     result.leaked = !!(ip && result.directIp && ip === result.directIp);
   } catch {

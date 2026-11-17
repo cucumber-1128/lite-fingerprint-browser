@@ -10,7 +10,8 @@ const { spawn } = require('node:child_process');
 const net = require('node:net');
 const { CDP } = require('./cdp');
 const { findBrowser } = require('./browser');
-const { createRelay } = require('./proxy');
+const { createRelay, testProxy } = require('./proxy');
+const { countryToLocale, TIMEZONE_COORDS } = require('./cliutil');
 const runtime = require('./runtime');
 const store = require('./store');
 
@@ -362,7 +363,65 @@ function buildConfig(profile, nonce) {
     rectNoise: profile.rectNoise === true,
     webrtc: profile.webrtc || 'proxy',
     fakeIp: deriveFakeIp(profile.seed || 'seed'),
+    publicIp: (profile.geo && profile.geo.ip) || '',
   };
+}
+
+/** 按 profile.geo 或时区计算带确定性街区级微扰的经纬度 */
+function resolveGeolocation(profile) {
+  const g = profile && profile.geo;
+  const tzCoord = TIMEZONE_COORDS[profile && profile.timezone];
+  const base =
+    g && typeof g.lat === 'number' && typeof g.lon === 'number' && isFinite(g.lat) && isFinite(g.lon)
+      ? { lat: g.lat, lon: g.lon, spread: 0.004 }
+      : tzCoord
+        ? { lat: tzCoord.lat, lon: tzCoord.lon, spread: 0.02 }
+        : null;
+  if (!base) return null;
+  const h = crypto
+    .createHash('sha256')
+    .update(String((profile && (profile.seed || profile.id)) || 'geo'))
+    .digest();
+  const jLat = ((h[0] / 255) * 2 - 1) * base.spread;
+  const jLon = ((h[1] / 255) * 2 - 1) * base.spread;
+  return {
+    latitude: Math.round((base.lat + jLat) * 1e6) / 1e6,
+    longitude: Math.round((base.lon + jLon) * 1e6) / 1e6,
+    accuracy: 25 + (h[4] % 45),
+  };
+}
+
+/** 经代理探测出口地理信息，并自动对齐环境的时区、语言与经纬度 */
+async function syncProfileGeoFromProxy(profileId) {
+  const p = store.get(profileId);
+  if (!p) throw new Error('环境不存在：' + profileId);
+  const px = p.proxy || {};
+  if (px.type === 'none' || !px.host || !px.port) {
+    throw new Error('这个环境没有配置代理');
+  }
+  const r = await testProxy({
+    type: px.type,
+    host: px.host,
+    port: px.port,
+    username: px.username,
+    password: px.password,
+  });
+  if (!r.ok) {
+    throw new Error(r.error || '代理测试失败');
+  }
+  const loc = countryToLocale(r.countryCode);
+  const patch = {
+    locale: loc.locale,
+    languages: loc.languages,
+  };
+  if (r.timezone) patch.timezone = r.timezone;
+  if (typeof r.lat === 'number' && typeof r.lon === 'number') {
+    patch.geo = { lat: r.lat, lon: r.lon, ip: r.ip };
+  } else if (r.ip) {
+    patch.geo = { ...(p.geo || {}), ip: r.ip };
+  }
+  const updated = store.update(profileId, patch);
+  return { profile: updated, proxy: r };
 }
 
 /** 读取并校验注入脚本，把 __CFG__ 替换成该环境的指纹参数 */
@@ -467,6 +526,9 @@ function makeSessionPatcher(cdp, ctx) {
     await cdp.try_('Emulation.setUserAgentOverride', ctx.uaOverride, sessionId);
     await cdp.try_('Emulation.setTimezoneOverride', { timezoneId: ctx.timezone }, sessionId);
     await cdp.try_('Emulation.setLocaleOverride', { locale: ctx.locale }, sessionId);
+    if (ctx.geo) {
+      await cdp.try_('Emulation.setGeolocationOverride', ctx.geo, sessionId);
+    }
     // 同一个 target 只挂一次注入脚本。
     // 幂等放在 Node 侧（而不是在页面里留一个 symbol 标记）——页面里任何标记
     // 都能被 Object.getOwnPropertySymbols(window) 一行枚举出来，等于自曝。
@@ -709,6 +771,7 @@ async function reattach() {
         },
         timezone: profile.timezone || 'Asia/Shanghai',
         locale: profile.locale || 'zh-CN',
+        geo: resolveGeolocation(profile),
         script: buildInjectionSource(profile),
         scripted: instance.scripted,
       };
@@ -718,6 +781,7 @@ async function reattach() {
       instance.__uaOverride = ctx.uaOverride;
       instance.__tz = ctx.timezone;
       instance.__locale = ctx.locale;
+      instance.__geo = ctx.geo;
       instance.__expect = {
         hardwareConcurrency: cfg.hardwareConcurrency,
         deviceMemory: cfg.deviceMemory,
@@ -755,7 +819,7 @@ async function reattach() {
 /* ---------------------------------- 启动 ---------------------------------- */
 
 async function launch(profileId, options = {}) {
-  const profile = store.get(profileId);
+  let profile = store.get(profileId);
   if (!profile) throw new Error('环境不存在：' + profileId);
   if (running.has(profileId)) {
     const inst = running.get(profileId);
@@ -767,6 +831,19 @@ async function launch(profileId, options = {}) {
     throw new Error(
       '没找到 Chromium 内核浏览器。装 Chrome/Edge，或用 FB_BROWSER 环境变量指定 chrome.exe 路径'
     );
+  }
+
+  let proxy = profile.proxy || {};
+  let useProxy = proxy.type !== 'none' && proxy.host && proxy.port;
+  if ((options.autoGeo || profile.autoGeo) && useProxy) {
+    try {
+      await syncProfileGeoFromProxy(profileId);
+      profile = store.get(profileId);
+      proxy = profile.proxy || {};
+      useProxy = proxy.type !== 'none' && proxy.host && proxy.port;
+    } catch (e) {
+      throw new Error('代理不可用，无法自动同步地区：' + (e && e.message ? e.message : e));
+    }
   }
 
   const userDataDir = store.profileDir(profileId);
@@ -789,8 +866,6 @@ async function launch(profileId, options = {}) {
 
   /* 1. 代理中继 */
   let relay = null;
-  const proxy = profile.proxy || {};
-  const useProxy = proxy.type !== 'none' && proxy.host && proxy.port;
   if (useProxy) {
     relay = await createRelay({
       type: proxy.type,
@@ -831,6 +906,8 @@ async function launch(profileId, options = {}) {
   }
   if (relay) {
     args.push('--proxy-server=http://127.0.0.1:' + relay.port);
+    // 禁止 Chrome 绕过代理做本地 DNS 解析，彻底防止 DNS 泄漏
+    args.push('--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1 , EXCLUDE localhost');
   }
   if (relay || (profile.webrtc || 'proxy') !== 'real') {
     // 禁止 WebRTC 走非代理的 UDP，避免真实 IP 泄露
@@ -926,6 +1003,7 @@ async function launch(profileId, options = {}) {
       uaOverride,
       timezone: profile.timezone || 'Asia/Shanghai',
       locale: profile.locale || 'zh-CN',
+      geo: resolveGeolocation(profile),
       script: buildInjectionSource(profile),
       scripted: instance.scripted,
     };
@@ -935,6 +1013,7 @@ async function launch(profileId, options = {}) {
     instance.__uaOverride = uaOverride;
     instance.__tz = ctx.timezone;
     instance.__locale = ctx.locale;
+    instance.__geo = ctx.geo;
     // probe 用这几个值交叉验证"补丁到底生没生效"（页面里不再留 symbol 标记）
     instance.__expect = {
       hardwareConcurrency: cfg.hardwareConcurrency,
@@ -1182,6 +1261,9 @@ async function evaluateInProbePage(profileId, expression) {
     await cdp.try_('Emulation.setUserAgentOverride', inst.__uaOverride || {}, sessionId);
     await cdp.try_('Emulation.setTimezoneOverride', { timezoneId: inst.__tz || 'Asia/Shanghai' }, sessionId);
     await cdp.try_('Emulation.setLocaleOverride', { locale: inst.__locale || 'zh-CN' }, sessionId);
+    if (inst.__geo) {
+      await cdp.try_('Emulation.setGeolocationOverride', inst.__geo, sessionId);
+    }
 
     // 注入脚本由 autoAttach 统一挂；这里只等它挂好（重复注入会让补丁叠加，指纹就变了）
     const t2 = Date.now();
@@ -1246,5 +1328,7 @@ module.exports = {
   buildConfig,
   buildUserAgent,
   buildUaMetadata,
+  resolveGeolocation,
+  syncProfileGeoFromProxy,
   PLATFORM_UA,
 };
