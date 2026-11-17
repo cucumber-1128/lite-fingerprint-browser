@@ -160,3 +160,61 @@ socks5:1.2.3.4:1080:user:pass
 4. 代理密码**只写不读**：`list`、导出都看不到密码；导入后需要重新填。
 5. 同一台机器上的多个环境共用出口网卡，真正隔离要靠一个环境一个代理 IP；时区/语言要和代理地区一致（预设已经帮你对齐）。
 6. 删环境会连 `data/profiles/<id>/` 一起删，Cookie 登录态没了，删之前确认。
+
+---
+
+## Agent 浏览器操控（MCP + CLI 无痕自动化）
+
+本程序支持通过 **Stdio MCP Server** 或 **CLI `--json` 命令** 让外部 AI Agent（Claude Code、Codex、Antigravity、Cursor、Pi 等）直接操控运行中的指纹环境完成浏览、分析与表单任务，全程不注入 `window` 全局标记、不调用 `Runtime.enable`、所有点击/按键保持浏览器原生 `isTrusted = true`。
+
+### MCP 一键挂载（推荐）
+
+程序内置零依赖 MCP Stdio 服务端（`fb.exe mcp` / `node src/index.js mcp`），提供 `fb_list_profiles`、`fb_create_profile`、`fb_launch`、`fb_stop`、`fb_cookies`、`fb_tabs`、`fb_goto`、`fb_snapshot`、`fb_click`、`fb_fill`、`fb_type`、`fb_press`、`fb_hover`、`fb_select`、`fb_scroll`、`fb_upload`、`fb_wait`、`fb_focus`、`fb_screenshot`、`fb_eval` 共 20 个工具：
+
+```text
+# Claude Code
+claude mcp add lite-fingerprint -- "fb.exe" mcp
+
+# Codex (~/.codex/config.toml)
+[mcp_servers.lite-fingerprint]
+command = "fb.exe"
+args = ["mcp"]
+
+# Antigravity / Cursor / Windsurf (mcpServers JSON)
+{
+  "mcpServers": {
+    "lite-fingerprint": {
+      "command": "fb.exe",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### 页面操控 CLI 命令流（`fb.exe` / `node src/index.js`）
+
+所有页面命令先通过 `launch <id>` 启动环境，再按 `goto -> snapshot -> fill/click/...` 循环工作：
+
+| 命令 | 说明 |
+|---|---|
+| `tabs <id> [list\|new\|switch\|close] [URL或索引]` | 列出、新建（保留全套指纹注入）、切换或关闭标签页 |
+| `goto <id> <url> [--tab T] [--wait-until load\|domcontentloaded]` | 打开网址并等待页面就绪；另有 `back` / `forward` / `reload` |
+| `snapshot <id> [--tab T] [--selector CSS] [--max-text N]` | 提取页面标题、URL、正文摘要，以及可交互元素引用 `@e1` `@e2`...（引用保存在 Node 内存，页面零痕迹） |
+| `click <id> <@e1\|选择器\|text=...> [--right] [--double]` | 鼠标移动并点击目标中心（带微扰，触发可信点击事件） |
+| `fill <id> <@e1\|选择器\|text=...> <文本> [--enter] [--no-clear]` | 点击聚焦并写入完整文本（支持中文/Unicode） |
+| `type <id> [target] <文本> [--delay MS]` | 逐字符模拟真实键盘敲击 |
+| `press <id> <key> [--target SEL]` | 发送按键或组合键（`Enter` / `Tab` / `Escape` / `Backspace` / `Control+a` 等） |
+| `hover <id> <@e1\|选择器\|text=...>` | 鼠标悬停到元素上方 |
+| `select <id> <@e1\|选择器> <值或选项文本>` | 操作 `<select>` 下拉框 |
+| `scroll <id> [--dy 500] [--dx 0] [--target SEL]` | 派发原生滚轮滚动事件 |
+| `upload <id> <@e1\|选择器> <文件>...` | 给 `<input type="file">` 传入本地文件 |
+| `wait <id> [--selector S] [--text T] [--url U] [--ms N] [--timeout N]` | 等待元素可见 / 文本出现 / URL 跳转或延时 |
+| `focus <id> [--tab T]` | 将当前环境的浏览器窗口切到前台焦点 |
+| `screenshot <id> [文件.png] [--full] [--tab T]` | 保存 PNG 截图（CLI 加 `--json` 且不传文件时输出 base64） |
+| `eval <id> <JS表达式> [--tab T]` | 在页面执行只读/分析 JS 表达式（无 `Runtime.enable`） |
+
+### 人机验证与二次验证规范（Human-in-the-Loop）
+
+- 当 `goto`、`snapshot` 或 `wait` 返回 `"blockedByChallenge": true` 时，说明页面出现了 Cloudflare Turnstile、reCAPTCHA、hCaptcha、极验等人机验证组件，或登录遇到短信 / 邮箱 / 2FA 验证码。
+- **严禁自动点击、尝试破解或绕过任何验证码 / 反机器人挑战**。`click` 等操控原语一旦命中验证组件或验证 iframe 会直接拒绝执行。
+- 正确做法：立即停止后续自动点击，调用 `focus <id>`（或 MCP 工具 `fb_focus`）把该指纹窗口切到前台，并在对话中明确告知用户当前环境名称与页面提示，等待用户手动在浏览器里完成验证后，再继续后续操作。

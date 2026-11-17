@@ -87,7 +87,7 @@ class CDP extends EventEmitter {
   }
 
   /** 发送一条 CDP 指令 */
-  send(method, params = {}, sessionId) {
+  send(method, params = {}, sessionId, timeoutMs = 15000) {
     if (this._closed) return Promise.reject(new Error('CDP 连接已关闭'));
     const id = ++this._id;
     const payload = { id, method, params };
@@ -104,7 +104,7 @@ class CDP extends EventEmitter {
           this._pending.delete(id);
           reject(new Error('CDP 指令超时：' + method));
         }
-      }, 15000);
+      }, timeoutMs);
       if (typeof timer.unref === 'function') timer.unref();
       this._pending.set(id, { resolve, reject, timer });
     });

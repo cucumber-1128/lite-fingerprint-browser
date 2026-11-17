@@ -20,6 +20,7 @@
     <button class="btn ghost" id="btnImport">导入</button>
     <input type="file" id="importFile" accept="application/json,.json" hidden />
     <button class="btn ghost" id="btnRefresh">刷新</button>
+    <button class="btn" id="btnAgentGuide" title="查看 Claude Code / Codex / Antigravity / Pi 的接入配置">Agent 接入</button>
     <button class="btn ghost danger" id="btnQuit" title="关闭所有环境并退出控制台">退出</button>
     <button class="btn" id="btnBatchNew">批量新建</button>
     <button class="btn primary" id="btnNew">+ 新建环境</button>
@@ -253,6 +254,51 @@
     <span class="err" id="cookieErr"></span>
     <button type="button" class="btn ghost" id="btnCloseCookie">关闭</button>
     <button type="button" class="btn primary" id="btnImportCookies">导入 Cookie</button>
+  </footer>
+</dialog>
+
+<!-- Agent 接入指南 -->
+<dialog id="agentDlg">
+  <h2>Agent 接入指南（MCP & CLI）</h2>
+  <p class="agent-intro">
+    通过内置零依赖 MCP 服务或 CLI 命令，可直接让 <b>Claude Code / Codex / Antigravity / Cursor / Pi</b> 启动指定指纹环境并像真人一样浏览网页、读取结构、填写表单与多标签操作（遇人机验证会自动提示切回窗口人工接管）。
+  </p>
+
+  <div class="agent-block">
+    <div class="agent-head">
+      <span>1. Claude Code（一行命令挂载 MCP）</span>
+      <button type="button" class="btn tiny" data-copy-target="#codeClaude">复制</button>
+    </div>
+    <pre id="codeClaude" class="agent-code"></pre>
+  </div>
+
+  <div class="agent-block">
+    <div class="agent-head">
+      <span>2. Codex（添加到 ~/.codex/config.toml）</span>
+      <button type="button" class="btn tiny" data-copy-target="#codeCodex">复制</button>
+    </div>
+    <pre id="codeCodex" class="agent-code"></pre>
+  </div>
+
+  <div class="agent-block">
+    <div class="agent-head">
+      <span>3. Antigravity / Cursor / Windsurf（mcpServers JSON）</span>
+      <button type="button" class="btn tiny" data-copy-target="#codeMcpJson">复制</button>
+    </div>
+    <pre id="codeMcpJson" class="agent-code"></pre>
+  </div>
+
+  <div class="agent-block">
+    <div class="agent-head">
+      <span>4. Pi / Shell Agent（CLI 无痕工作流，完整命令见同目录 AGENTS.md）</span>
+      <button type="button" class="btn tiny" data-copy-target="#codeCli">复制</button>
+    </div>
+    <pre id="codeCli" class="agent-code"></pre>
+  </div>
+
+  <footer>
+    <span style="color: var(--muted); font-size: 12px;">全部浏览器操控保持原生可信事件（isTrusted=true），不在页面注入额外属性。</span>
+    <button type="button" class="btn primary" id="btnCloseAgent">关闭</button>
   </footer>
 </dialog>
 

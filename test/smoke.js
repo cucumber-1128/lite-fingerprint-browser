@@ -11,13 +11,14 @@ const http = require('node:http');
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
-const { execFileSync, spawnSync } = require('node:child_process');
+const { execFileSync, spawn, spawnSync } = require('node:child_process');
 
 // 测试不碰生产数据：整个 data 目录指到临时目录
 process.env.FB_DATA = process.env.FB_DATA || path.join(os.tmpdir(), 'fb-smoke-' + process.pid);
 
 const store = require('../src/store');
 const launcher = require('../src/launch');
+const agent = require('../src/agent');
 const { CDP } = require('../src/cdp');
 const { createRelay } = require('../src/proxy');
 const { findBrowser } = require('../src/browser');
@@ -1101,6 +1102,242 @@ async function cliDaemonChecks() {
   }
 }
 
+/* --------------- 6. Agent 无痕操控原语与 MCP 协议自检 --------------- */
+
+async function agentAndMcpChecks() {
+  console.log('\n[6] Agent 无痕操控原语与 MCP 协议自检');
+
+  const srv = http.createServer((req, res) => {
+    if (req.url === '/challenge') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(
+        '<!doctype html><meta charset="utf-8"><title>挑战页</title><body>' +
+          '<h1>安全验证</h1>' +
+          '<iframe src="https://challenges.cloudflare.com/turnstile/v0/api.js" style="width:300px;height:65px;border:0"></iframe>' +
+          '<button id="after">下一步</button></body>'
+      );
+      return;
+    }
+    if (req.url === '/tab2') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<!doctype html><meta charset="utf-8"><title>第二个标签页</title><body><p>tab2 ok</p></body>');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(
+      '<!doctype html><meta charset="utf-8"><title>注册测试页</title><body>' +
+        '<h2>账号注册</h2>' +
+        '<form onsubmit="return false">' +
+        '<input id="user" placeholder="用户名" />' +
+        '<select id="role"><option value="buyer">买家</option><option value="seller">卖家</option></select>' +
+        '<input id="avatar" type="file" />' +
+        '<button id="sub" type="button">提交注册</button>' +
+        '</form>' +
+        '<pre id="result"></pre>' +
+        '<script>' +
+        'document.getElementById("sub").addEventListener("click", function (ev) {' +
+        '  var f = document.getElementById("avatar").files;' +
+        '  document.getElementById("result").textContent = JSON.stringify({' +
+        '    value: document.getElementById("user").value,' +
+        '    role: document.getElementById("role").value,' +
+        '    fileCount: f ? f.length : 0,' +
+        '    fileName: f && f[0] ? f[0].name : "",' +
+        '    isTrusted: ev.isTrusted' +
+        '  });' +
+        '});' +
+        '</script></body>'
+    );
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const baseUrl = 'http://127.0.0.1:' + srv.address().port;
+
+  const p = store.create({
+    name: 'Agent测试环境',
+    platform: 'win',
+    timezone: 'America/Chicago',
+    locale: 'en-US',
+    languages: ['en-US', 'en'],
+    hardwareConcurrency: 8,
+  });
+
+  const tempUpload = path.join(os.tmpdir(), 'fb-upload-' + process.pid + '.txt');
+  const shotPath = path.join(os.tmpdir(), 'fb-shot-' + process.pid + '.png');
+  fs.writeFileSync(tempUpload, 'hello-upload', 'utf8');
+
+  const mcpData = path.join(os.tmpdir(), 'fb-mcp-smoke-' + process.pid);
+
+  try {
+    await launcher.launch(p.id);
+
+    const nav = await agent.navigate(p.id, { url: baseUrl + '/' });
+    eq(nav.title, '注册测试页', 'agent.navigate 打开测试页面并返回标题');
+    eq(nav.blockedByChallenge, false, '普通表单页未误报人机验证');
+
+    const snap = await agent.snapshot(p.id);
+    ok(snap.elementCount >= 4 && snap.elements.some((e) => e.ref === '@e1'), 'agent.snapshot 返回 @e1..@eN 可交互元素引用');
+    ok((snap.text || '').includes('账号注册'), 'agent.snapshot 提取页面可读正文');
+
+    // 零痕迹审计：DOM 与 window 上不得残留任何 __fb / agent / data-ref 标记
+    const footprint = await agent.evaluate(p.id, {
+      expression: `(() => {
+        const html = document.documentElement.outerHTML;
+        const winKeys = Object.getOwnPropertyNames(window).filter((k) => /__fb|agentRef/i.test(k));
+        const winSyms = Object.getOwnPropertySymbols(window).map((s) => String(s)).filter((s) => /fb|agent/i.test(s));
+        return {
+          hasDataMarker: /data-fb|data-agent|@e1/.test(html),
+          winKeys,
+          winSyms
+        };
+      })()`,
+    });
+    ok(
+      footprint.value &&
+        footprint.value.hasDataMarker === false &&
+        footprint.value.winKeys.length === 0 &&
+        footprint.value.winSyms.length === 0,
+      'snapshot 不在 DOM 属性或 window 上留下任何全局标记（页面零痕迹）',
+      footprint.value
+    );
+
+    const userEl = snap.elements.find((e) => e.tag === 'input' && e.type !== 'file');
+    const roleEl = snap.elements.find((e) => e.tag === 'select');
+    const fileEl = snap.elements.find((e) => e.tag === 'input' && e.type === 'file');
+    ok(!!(userEl && roleEl && fileEl), '快照准确识别输入框 / 下拉框 / 文件控件');
+
+    await agent.act(p.id, { action: 'fill', target: userEl.ref, value: 'Alice_测试' });
+    await agent.act(p.id, { action: 'select', target: roleEl.ref, value: 'seller' });
+    await agent.act(p.id, { action: 'upload', target: fileEl.ref, files: [tempUpload] });
+    await agent.act(p.id, { action: 'click', target: 'text=提交注册' });
+
+    const submitRes = await agent.evaluate(p.id, {
+      expression: 'JSON.parse(document.getElementById("result").textContent || "{}")',
+    });
+    const submitted = submitRes.value || {};
+    eq(submitted.value, 'Alice_测试', 'agent.fill 支持 Unicode/中文输入并写入输入框');
+    eq(submitted.role, 'seller', 'agent.select 成功切换 <select> 选项并触发 change');
+    eq(submitted.fileCount, 1, 'agent.upload 成功为 <input type=file> 挂载本地文件');
+    eq(submitted.isTrusted, true, 'agent.click 触发真实浏览器信任事件 (event.isTrusted === true)');
+
+    // 截图校验 PNG 文件头
+    const shot = await agent.screenshot(p.id, { path: shotPath });
+    const pngBytes = fs.readFileSync(shot.path);
+    ok(
+      pngBytes.length > 500 && pngBytes[0] === 0x89 && pngBytes[1] === 0x50 && pngBytes[2] === 0x4e && pngBytes[3] === 0x47,
+      'agent.screenshot 输出合法 PNG 图片（' + pngBytes.length + ' 字节）'
+    );
+
+    // 多标签页控制 + 指纹持久性
+    const t2 = await agent.newTab(p.id, baseUrl + '/tab2');
+    const tabsBefore = await agent.listTabs(p.id);
+    ok(tabsBefore.tabs.length >= 2, 'agent.newTab 成功打开第二个标签页（当前 ' + tabsBefore.tabs.length + ' 个）');
+    const tab2Tz = await agent.evaluate(p.id, {
+      expression: 'Intl.DateTimeFormat().resolvedOptions().timeZone',
+    });
+    eq(tab2Tz.value, 'America/Chicago', '新开标签页保持环境设定的 America/Chicago 时区');
+    await agent.switchTab(p.id, 0);
+    const tabsSwitched = await agent.listTabs(p.id);
+    eq(tabsSwitched.activeTargetId, tabsBefore.tabs[0].targetId, 'agent.switchTab 可切回第 0 个标签页');
+    await agent.closeTab(p.id, t2.targetId);
+    const tabsAfterClose = await agent.listTabs(p.id);
+    ok(!tabsAfterClose.tabs.some((t) => t.targetId === t2.targetId), 'agent.closeTab 成功关闭指定标签页');
+
+    // 人机验证护栏：仅被动识别，绝不自动点击验证 iframe
+    await agent.navigate(p.id, { url: baseUrl + '/challenge' });
+    const snapChallenge = await agent.snapshot(p.id);
+    eq(snapChallenge.blockedByChallenge, true, 'snapshot 准确识别人机验证组件并标记 blockedByChallenge=true');
+    let clickBlocked = false;
+    try {
+      await agent.act(p.id, { action: 'click', target: 'iframe' });
+    } catch (e) {
+      clickBlocked = /人机验证|禁止/.test(String(e && e.message));
+    }
+    ok(clickBlocked, 'agent.act 严禁点击人机验证 iframe（安全护栏生效）');
+
+    // MCP Stdio 服务端协议端到端自检
+    const indexJs = path.resolve(__dirname, '..', 'src', 'index.js');
+    const mcpProc = spawn(process.execPath, [indexJs, 'mcp'], {
+      env: { ...process.env, FB_DATA: mcpData },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const mcpReply = await new Promise((resolve, reject) => {
+      let stdoutBuf = '';
+      let stderrBuf = '';
+      const messages = [];
+      const timer = setTimeout(() => {
+        try { mcpProc.kill(); } catch {}
+        reject(new Error('MCP 测试超时; stdout=' + stdoutBuf + '; stderr=' + stderrBuf));
+      }, 20000);
+      mcpProc.stdout.setEncoding('utf8');
+      mcpProc.stdout.on('data', (chunk) => {
+        stdoutBuf += chunk;
+        const lines = stdoutBuf.split('\n');
+        stdoutBuf = lines.pop();
+        for (const line of lines) {
+          const s = line.trim();
+          if (!s) continue;
+          try {
+            messages.push(JSON.parse(s));
+          } catch (e) {
+            clearTimeout(timer);
+            reject(new Error('MCP stdout 混入非 JSON 内容：' + s));
+            return;
+          }
+        }
+        if (messages.some((m) => m.id === 1) && messages.some((m) => m.id === 2) && messages.some((m) => m.id === 3)) {
+          clearTimeout(timer);
+          mcpProc.stdin.end();
+          resolve(messages);
+        }
+      });
+      mcpProc.stderr.on('data', (d) => (stderrBuf += d.toString('utf8')));
+      mcpProc.on('error', (e) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+
+      const reqs = [
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'smoke', version: '1.0' } } },
+        { jsonrpc: '2.0', method: 'notifications/initialized', params: {} },
+        { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+        { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'fb_list_profiles', arguments: {} } },
+      ];
+      mcpProc.stdin.write(reqs.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    });
+
+    const mInit = mcpReply.find((m) => m.id === 1);
+    const mTools = mcpReply.find((m) => m.id === 2);
+    const mCall = mcpReply.find((m) => m.id === 3);
+    ok(mInit && mInit.result && mInit.result.serverInfo && mInit.result.serverInfo.name === 'lite-fingerprint', 'MCP initialize 握手返回 serverInfo');
+    eq(mTools && mTools.result && mTools.result.tools && mTools.result.tools.length, 20, 'MCP tools/list 注册全部 20 个工具');
+    const callPayload = mCall && mCall.result && mCall.result.content && mCall.result.content[0] && JSON.parse(mCall.result.content[0].text);
+    ok(callPayload && callPayload.ok === true && Array.isArray(callPayload.profiles), 'MCP tools/call(fb_list_profiles) 通过后台守护进程正常返回');
+  } catch (e) {
+    ok(false, 'Agent / MCP 测试异常: ' + (e && e.message ? e.message : e));
+  } finally {
+    await launcher.stop(p.id);
+    await sleep(300);
+    store.remove(p.id);
+    try {
+      const cinfo = JSON.parse(fs.readFileSync(path.join(mcpData, 'console.json'), 'utf8'));
+      if (cinfo && cinfo.port) {
+        await fetch('http://127.0.0.1:' + cinfo.port + '/api/shutdown', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        }).catch(() => {});
+        await sleep(350);
+      }
+    } catch {
+      /* ignore */
+    }
+    srv.close();
+    for (const f of [tempUpload, shotPath]) {
+      try { fs.rmSync(f, { force: true }); } catch {}
+    }
+    try { fs.rmSync(mcpData, { recursive: true, force: true }); } catch {}
+  }
+}
+
 /* ------------------------------- 跑起来 ------------------------------- */
 
 (async () => {
@@ -1112,6 +1349,7 @@ async function cliDaemonChecks() {
   await browserChecks();
   await headerChecks();
   await cliDaemonChecks();
+  await agentAndMcpChecks();
 
   console.log('\n' + '─'.repeat(58));
   if (failures.length) {

@@ -7,6 +7,7 @@ const { URL } = require('node:url');
 
 const store = require('./store');
 const launcher = require('./launch');
+const agent = require('./agent');
 const runtime = require('./runtime');
 const { testProxy } = require('./proxy');
 const { findBrowser } = require('./browser');
@@ -116,6 +117,7 @@ function createServer(opts = {}) {
     try {
       /* ------------------------------- API ------------------------------- */
       if (pathname.startsWith('/api/')) {
+        if (typeof opts.onActivity === 'function') opts.onActivity();
         if (method === 'POST' || method === 'PUT') {
           const ct = String(req.headers['content-type'] || '').toLowerCase();
           if (!ct.startsWith('application/json')) {
@@ -127,10 +129,19 @@ function createServer(opts = {}) {
 
         if (method === 'GET' && pathname === '/api/state') {
           const browser = findBrowser();
+          const entryScript = path.join(runtime.ROOT, 'src', 'index.js');
           return json(res, 200, {
             profiles: store.list().map(withRunning),
             running: launcher.listRunning(),
             browserPath: browser,
+            agentCli: globalThis.__FB_ASSETS__
+              ? { command: process.execPath, mcpArgs: ['mcp'], isPackaged: true }
+              : {
+                  command: process.execPath,
+                  mcpArgs: [entryScript, 'mcp'],
+                  scriptPath: entryScript,
+                  isPackaged: false,
+                },
             timezones: store.TIMEZONES,
             presets: Object.entries(PRESETS).map(([key, p]) => ({ key, ...p })),
             webglPool: store.WEBGL_POOL,
@@ -379,6 +390,49 @@ function createServer(opts = {}) {
             const input = body.cookies !== undefined ? body.cookies : body.text;
             const r = await launcher.importCookies(id, input);
             return json(res, 200, { ok: true, ...r });
+          }
+
+          if (method === 'GET' && action === 'tabs') {
+            return json(res, 200, await agent.listTabs(id));
+          }
+
+          if (method === 'POST' && action === 'tabs') {
+            const body = await readBody(req);
+            const act = String(body.action || 'list').toLowerCase();
+            if (act === 'new') return json(res, 200, await agent.newTab(id, body.url));
+            if (act === 'switch') return json(res, 200, await agent.switchTab(id, body.tab));
+            if (act === 'close') return json(res, 200, await agent.closeTab(id, body.tab));
+            return json(res, 200, await agent.listTabs(id));
+          }
+
+          if (method === 'POST' && action === 'goto') {
+            const body = await readBody(req);
+            return json(res, 200, await agent.navigate(id, body));
+          }
+
+          if (method === 'POST' && action === 'snapshot') {
+            const body = await readBody(req);
+            return json(res, 200, await agent.snapshot(id, body));
+          }
+
+          if (method === 'POST' && action === 'act') {
+            const body = await readBody(req);
+            return json(res, 200, await agent.act(id, body));
+          }
+
+          if (method === 'POST' && action === 'screenshot') {
+            const body = await readBody(req);
+            return json(res, 200, await agent.screenshot(id, body));
+          }
+
+          if (method === 'POST' && action === 'eval') {
+            const body = await readBody(req);
+            return json(res, 200, await agent.evaluate(id, body));
+          }
+
+          if (method === 'POST' && action === 'focus') {
+            const body = await readBody(req);
+            return json(res, 200, await agent.focus(id, body));
           }
         }
 

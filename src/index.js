@@ -24,6 +24,7 @@ const launcher = require('./launch');
 const { findBrowser } = require('./browser');
 const { testProxy } = require('./proxy');
 const { PRESETS, getPreset, parseProxyLine, parseProxies, readJsonArg } = require('./cliutil');
+const { startMcpServer } = require('./mcp');
 
 const argv = process.argv.slice(2);
 const jsonMode = hasFlag('json');
@@ -33,28 +34,58 @@ const cmd = wantHelp ? 'help' : first || 'serve';
 
 /* -------------------------------- 参数工具 -------------------------------- */
 
+const BOOL_FLAGS = new Set([
+  'json',
+  'all',
+  'auto-geo',
+  'no-open',
+  'daemon',
+  'machine',
+  'right',
+  'double',
+  'enter',
+  'no-clear',
+  'full',
+  'help',
+]);
+
 function hasFlag(name) {
   return argv.includes('--' + name);
 }
 
 function argValue(name) {
-  const i = argv.indexOf('--' + name);
-  if (i < 0) return null;
-  const v = argv[i + 1];
-  return v && !String(v).startsWith('--') ? v : null;
+  const prefix = '--' + name + '=';
+  for (let i = 0; i < argv.length; i++) {
+    const a = String(argv[i]);
+    if (a.startsWith(prefix)) return a.slice(prefix.length);
+    if (a === '--' + name) {
+      const v = argv[i + 1];
+      return v !== undefined && !String(v).startsWith('--') ? v : null;
+    }
+  }
+  return null;
 }
 
-/** 位置参数（跳过 --flag 与其值） */
+/** 位置参数（跳过 --flag 与带值选项，不吞掉布尔开关后面的位置参数） */
 function positional() {
   const out = [];
   for (let i = 1; i < argv.length; i++) {
-    const a = argv[i];
-    if (String(a).startsWith('--')) {
-      const v = argv[i + 1];
-      if (v !== undefined && !String(v).startsWith('--')) i++;
+    const a = String(argv[i]);
+    if (a === '--') {
+      for (let j = i + 1; j < argv.length; j++) out.push(argv[j]);
+      break;
+    }
+    if (a.startsWith('--')) {
+      const eqIdx = a.indexOf('=');
+      const flag = (eqIdx >= 0 ? a.slice(2, eqIdx) : a.slice(2)).toLowerCase();
+      if (eqIdx < 0 && !BOOL_FLAGS.has(flag)) {
+        const v = argv[i + 1];
+        if (v !== undefined && !String(v).startsWith('--')) i++;
+      }
       continue;
     }
-    out.push(a);
+    if (a === '-h') continue;
+    out.push(argv[i]);
   }
   return out;
 }
@@ -536,6 +567,323 @@ async function cmdDoctor() {
   return emit(report, text);
 }
 
+/* ----------------------------- Agent 页面操控 ----------------------------- */
+
+function encId(id) {
+  return encodeURIComponent(String(id || ''));
+}
+
+function formatSnapshotText(r) {
+  const lines = [
+    '页面: ' + (r.title || '(无标题)') + '  ' + (r.url || ''),
+    '可交互元素 (' + r.elementCount + '):',
+  ];
+  for (const el of (r.elements || []).slice(0, 60)) {
+    const val = el.value ? ' val=' + JSON.stringify(el.value) : '';
+    const chk = el.checked !== undefined ? ' checked=' + el.checked : '';
+    lines.push('  ' + el.ref.padEnd(5) + ' [' + el.role + '] ' + (el.name || '(无文案)') + val + chk);
+  }
+  if (r.blockedByChallenge && r.challenge) {
+    lines.push('⚠ ' + r.challenge.message + ' (' + r.challenge.type + ')');
+  }
+  if (r.text) {
+    lines.push('--- 正文摘要 ---');
+    lines.push(r.text.slice(0, 1200));
+  }
+  return lines.join('\n');
+}
+
+async function cmdTabs() {
+  const args = positional();
+  const id = args[0];
+  if (!id) return fail('用法：tabs <环境ID> [list|new|switch|close] [URL或索引]');
+  const sub = String(args[1] || 'list').toLowerCase();
+  const arg = args[2];
+  const live = await ensureDaemon();
+  let r;
+  if (sub === 'list') {
+    r = await consoleApi(live, 'GET', '/api/profiles/' + encId(id) + '/tabs');
+  } else if (sub === 'new' || sub === 'switch' || sub === 'close') {
+    const body = { action: sub };
+    if (sub === 'new') body.url = arg || argValue('url') || 'about:blank';
+    else body.tab = arg !== undefined ? arg : argValue('tab');
+    r = await consoleApi(live, 'POST', '/api/profiles/' + encId(id) + '/tabs', body, 25000);
+  } else {
+    return fail('未知 tabs 子命令：' + sub + '（支持 list / new / switch / close）');
+  }
+  const text = (r.tabs || [])
+    .map((t) => (t.active ? '* ' : '  ') + '[' + t.index + '] ' + (t.title || '(无标题)') + '  ' + t.url + '  (' + t.targetId + ')')
+    .join('\n');
+  return emit(r, text || '无标签页');
+}
+
+async function cmdNavigate(action) {
+  const args = positional();
+  const id = args[0];
+  if (!id) return fail('用法：' + action + ' <环境ID>' + (action === 'goto' ? ' <URL>' : ''));
+  const url = action === 'goto' ? args[1] || argValue('url') : undefined;
+  if (action === 'goto' && !url) return fail('用法：goto <环境ID> <URL>');
+  const timeoutMs = Number(argValue('timeout')) || 20000;
+  const live = await ensureDaemon();
+  const r = await consoleApi(
+    live,
+    'POST',
+    '/api/profiles/' + encId(id) + '/goto',
+    {
+      action,
+      url,
+      tab: argValue('tab'),
+      waitUntil: argValue('wait-until') || undefined,
+      timeoutMs,
+    },
+    Math.max(25000, timeoutMs + 5000)
+  );
+  let text = '✓ ' + (r.title || '(无标题)') + '  ' + r.url;
+  if (r.blockedByChallenge && r.challenge) text += '\n⚠ ' + r.challenge.message;
+  return emit(r, text);
+}
+
+async function cmdSnapshot() {
+  const args = positional();
+  const id = args[0];
+  if (!id) return fail('用法：snapshot <环境ID> [--tab T] [--selector CSS] [--max-text N]');
+  const live = await ensureDaemon();
+  const r = await consoleApi(
+    live,
+    'POST',
+    '/api/profiles/' + encId(id) + '/snapshot',
+    {
+      tab: argValue('tab'),
+      selector: argValue('selector') || undefined,
+      maxText: argValue('max-text') ? Number(argValue('max-text')) : undefined,
+      maxElements: argValue('max-elements') ? Number(argValue('max-elements')) : undefined,
+    },
+    20000
+  );
+  return emit(r, formatSnapshotText(r));
+}
+
+async function cmdClick() {
+  const args = positional();
+  const id = args[0];
+  const target = args[1] !== undefined ? args[1] : argValue('target');
+  const x = argValue('x') !== null ? Number(argValue('x')) : undefined;
+  const y = argValue('y') !== null ? Number(argValue('y')) : undefined;
+  if (!id || (!target && (x === undefined || y === undefined))) {
+    return fail('用法：click <环境ID> <@e1|选择器|text=...> [--right] [--double]');
+  }
+  const action = hasFlag('right') ? 'rightclick' : hasFlag('double') ? 'dblclick' : 'click';
+  const live = await ensureDaemon();
+  const r = await consoleApi(live, 'POST', '/api/profiles/' + encId(id) + '/act', {
+    action,
+    target,
+    x,
+    y,
+    tab: argValue('tab'),
+  });
+  return emit(r, '✓ ' + action + ' (' + r.x + ', ' + r.y + ')');
+}
+
+async function cmdFill() {
+  const args = positional();
+  const id = args[0];
+  const target = args[1];
+  const value = args.length >= 3 ? args.slice(2).join(' ') : argValue('value');
+  if (!id || !target || value === null || value === undefined) {
+    return fail('用法：fill <环境ID> <@e1|选择器|text=...> <文本> [--enter] [--no-clear]');
+  }
+  const live = await ensureDaemon();
+  const r = await consoleApi(live, 'POST', '/api/profiles/' + encId(id) + '/act', {
+    action: 'fill',
+    target,
+    value,
+    clear: !hasFlag('no-clear'),
+    pressEnter: hasFlag('enter'),
+    tab: argValue('tab'),
+  });
+  return emit(r, '✓ 已填入 ' + r.length + ' 个字符到 ' + target);
+}
+
+async function cmdType() {
+  const args = positional();
+  const id = args[0];
+  let target = argValue('target');
+  let text = argValue('text');
+  if (args.length >= 3) {
+    target = args[1];
+    text = args.slice(2).join(' ');
+  } else if (args.length === 2) {
+    text = args[1];
+  }
+  if (!id || text === null || text === undefined) {
+    return fail('用法：type <环境ID> [target] <文本> [--delay MS]');
+  }
+  const live = await ensureDaemon();
+  const r = await consoleApi(
+    live,
+    'POST',
+    '/api/profiles/' + encId(id) + '/act',
+    {
+      action: 'type',
+      target,
+      text,
+      delayMs: argValue('delay') !== null ? Number(argValue('delay')) : undefined,
+      tab: argValue('tab'),
+    },
+    30000
+  );
+  return emit(r, '✓ 已逐字输入 ' + r.length + ' 个字符');
+}
+
+async function cmdPress() {
+  const args = positional();
+  const id = args[0];
+  const key = args[1] || argValue('key');
+  if (!id || !key) return fail('用法：press <环境ID> <按键名> [--target SEL]');
+  const live = await ensureDaemon();
+  const r = await consoleApi(live, 'POST', '/api/profiles/' + encId(id) + '/act', {
+    action: 'press',
+    key,
+    target: argValue('target'),
+    tab: argValue('tab'),
+  });
+  return emit(r, '✓ 已按键：' + r.key);
+}
+
+async function cmdHover() {
+  const args = positional();
+  const id = args[0];
+  const target = args[1] || argValue('target');
+  if (!id || !target) return fail('用法：hover <环境ID> <@e1|选择器|text=...>');
+  const live = await ensureDaemon();
+  const r = await consoleApi(live, 'POST', '/api/profiles/' + encId(id) + '/act', {
+    action: 'hover',
+    target,
+    tab: argValue('tab'),
+  });
+  return emit(r, '✓ 已悬停 (' + r.x + ', ' + r.y + ')');
+}
+
+async function cmdSelect() {
+  const args = positional();
+  const id = args[0];
+  const target = args[1];
+  const value = args.length >= 3 ? args[2] : argValue('value');
+  if (!id || !target || value === null || value === undefined) {
+    return fail('用法：select <环境ID> <@e1|选择器> <选项value或文本>');
+  }
+  const live = await ensureDaemon();
+  const r = await consoleApi(live, 'POST', '/api/profiles/' + encId(id) + '/act', {
+    action: 'select',
+    target,
+    value,
+    tab: argValue('tab'),
+  });
+  return emit(r, '✓ 已选择：' + r.label + ' (' + r.value + ')');
+}
+
+async function cmdScroll() {
+  const args = positional();
+  const id = args[0];
+  if (!id) return fail('用法：scroll <环境ID> [--dy 500] [--dx 0] [--target SEL]');
+  const live = await ensureDaemon();
+  const r = await consoleApi(live, 'POST', '/api/profiles/' + encId(id) + '/act', {
+    action: 'scroll',
+    target: args[1] || argValue('target'),
+    deltaX: argValue('dx') !== null ? Number(argValue('dx')) : 0,
+    deltaY: argValue('dy') !== null ? Number(argValue('dy')) : 500,
+    tab: argValue('tab'),
+  });
+  return emit(r, '✓ 已滚动 dx=' + r.deltaX + ' dy=' + r.deltaY);
+}
+
+async function cmdUpload() {
+  const args = positional();
+  const id = args[0];
+  const target = args[1];
+  const files = args.slice(2);
+  if (!id || !target || !files.length) return fail('用法：upload <环境ID> <@e1|选择器> <文件路径>...');
+  const live = await ensureDaemon();
+  const r = await consoleApi(live, 'POST', '/api/profiles/' + encId(id) + '/act', {
+    action: 'upload',
+    target,
+    files,
+    tab: argValue('tab'),
+  });
+  return emit(r, '✓ 已选择文件：' + (r.files || []).join(', '));
+}
+
+async function cmdWait() {
+  const args = positional();
+  const id = args[0];
+  if (!id) return fail('用法：wait <环境ID> [--selector CSS] [--text STR] [--url SUBSTR] [--ms N] [--timeout N]');
+  const timeoutMs = Number(argValue('timeout')) || 10000;
+  const live = await ensureDaemon();
+  const r = await consoleApi(
+    live,
+    'POST',
+    '/api/profiles/' + encId(id) + '/act',
+    {
+      action: 'wait',
+      selector: argValue('selector'),
+      target: argValue('target'),
+      text: argValue('text'),
+      urlIncludes: argValue('url'),
+      ms: argValue('ms') !== null ? Number(argValue('ms')) : undefined,
+      timeoutMs,
+      tab: argValue('tab'),
+    },
+    Math.max(20000, timeoutMs + 5000)
+  );
+  const text = r.blockedByChallenge
+    ? '⚠ ' + (r.error || (r.challenge && r.challenge.message) || '检测到人机验证，已中止等待')
+    : '✓ 等待条件已满足（' + (r.elapsedMs || 0) + 'ms）';
+  return emit(r, text);
+}
+
+async function cmdFocus() {
+  const id = positional()[0];
+  if (!id) return fail('用法：focus <环境ID> [--tab T]');
+  const live = await ensureDaemon();
+  const r = await consoleApi(live, 'POST', '/api/profiles/' + encId(id) + '/focus', {
+    tab: argValue('tab'),
+  });
+  return emit(r, '✓ 已将窗口切到前台：' + (r.title || r.url || r.targetId));
+}
+
+async function cmdScreenshot() {
+  const args = positional();
+  const id = args[0];
+  if (!id) return fail('用法：screenshot <环境ID> [输出文件.png] [--full] [--tab T]');
+  const outPath = args[1] || argValue('out') || (!jsonMode ? 'screenshot-' + id + '.png' : undefined);
+  const live = await ensureDaemon();
+  const r = await consoleApi(
+    live,
+    'POST',
+    '/api/profiles/' + encId(id) + '/screenshot',
+    {
+      path: outPath,
+      fullPage: hasFlag('full'),
+      tab: argValue('tab'),
+    },
+    25000
+  );
+  return emit(r, r.path ? '✓ 已保存截图：' + r.path + '（' + r.bytes + ' 字节）' : '✓ 截图成功（' + r.bytes + ' 字节）');
+}
+
+async function cmdEval() {
+  const args = positional();
+  const id = args[0];
+  const expr = args.length >= 2 ? args.slice(1).join(' ') : argValue('expression');
+  if (!id || !expr) return fail('用法：eval <环境ID> <JS表达式>');
+  const live = await ensureDaemon();
+  const r = await consoleApi(live, 'POST', '/api/profiles/' + encId(id) + '/eval', {
+    expression: expr,
+    tab: argValue('tab'),
+  });
+  return emit(r, typeof r.value === 'string' ? r.value : JSON.stringify(r.value, null, 2));
+}
+
 function printHelp() {
   const bin = globalThis.__FB_ASSETS__ ? path.basename(process.execPath) : 'node src/index.js';
   const lines = [
@@ -559,6 +907,18 @@ function printHelp() {
     '  ' + bin + ' import <文件.json>                导入',
     '  ' + bin + ' presets [--json]                  列出地区预设',
     '  ' + bin + ' doctor [--json]                   环境自检',
+    '',
+    '页面操控与 MCP（供 AI Agent 操作页面，全部支持 --json）：',
+    '  ' + bin + ' mcp                               启动 Stdio MCP 服务（Claude/Codex/Antigravity）',
+    '  ' + bin + ' tabs <id> [list|new|switch|close] 管理标签页',
+    '  ' + bin + ' goto <id> <url>                   打开网址（另有 back / forward / reload）',
+    '  ' + bin + ' snapshot <id>                     获取页面 @e1/@e2 元素引用与正文摘要',
+    '  ' + bin + ' click <id> <@e1|sel|text=...>     原生可信鼠标点击（--right / --double）',
+    '  ' + bin + ' fill <id> <target> <值> [--enter] 聚焦填入文本',
+    '  ' + bin + ' type <id> [target] <文本>         逐字符模拟键盘敲击',
+    '  ' + bin + ' press <id> <key>                  发送按键/组合键（如 Enter / Control+a）',
+    '  ' + bin + ' hover|select|scroll|upload <id>... 悬停 / 下拉选择 / 滚轮 / 文件上传',
+    '  ' + bin + ' wait|focus|screenshot|eval <id>... 等待条件 / 窗口置前 / 截图 / JS 评估',
     '',
     'create 选项：',
     '  --preset us-shop      地区预设（presets 命令可列）',
@@ -603,9 +963,13 @@ async function serve() {
 
   await launcher.reattach().catch(() => []);
   let uiVisited = false;
+  let idleTicks = 0;
   const server = createServer({
     onUiVisit: () => {
       uiVisited = true;
+    },
+    onActivity: () => {
+      idleTicks = 0;
     },
   });
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
@@ -659,7 +1023,6 @@ async function serve() {
 
   if (isDaemon) {
     let everHadRunning = launcher.listRunning().length > 0;
-    let idleTicks = 0;
     const idleTimer = setInterval(() => {
       if (launcher.listRunning().length > 0) {
         everHadRunning = true;
@@ -749,6 +1112,62 @@ async function main() {
       break;
     case 'cookie-import':
       await cmdCookieImport(positional()[0], positional()[1]);
+      break;
+    case 'tabs':
+      await cmdTabs();
+      break;
+    case 'goto':
+    case 'open':
+      await cmdNavigate('goto');
+      break;
+    case 'back':
+    case 'forward':
+    case 'reload':
+      await cmdNavigate(cmd);
+      break;
+    case 'snapshot':
+    case 'snap':
+      await cmdSnapshot();
+      break;
+    case 'click':
+      await cmdClick();
+      break;
+    case 'fill':
+      await cmdFill();
+      break;
+    case 'type':
+      await cmdType();
+      break;
+    case 'press':
+      await cmdPress();
+      break;
+    case 'hover':
+      await cmdHover();
+      break;
+    case 'select':
+      await cmdSelect();
+      break;
+    case 'scroll':
+      await cmdScroll();
+      break;
+    case 'upload':
+      await cmdUpload();
+      break;
+    case 'wait':
+      await cmdWait();
+      break;
+    case 'focus':
+      await cmdFocus();
+      break;
+    case 'screenshot':
+    case 'shot':
+      await cmdScreenshot();
+      break;
+    case 'eval':
+      await cmdEval();
+      break;
+    case 'mcp':
+      await startMcpServer({ ensureDaemon, consoleApi });
       break;
     case 'presets':
       await cmdPresets();

@@ -1134,6 +1134,10 @@ function publicInfo(inst) {
   };
 }
 
+function getInstance(profileId) {
+  return running.get(profileId) || null;
+}
+
 function getRunning(profileId) {
   const inst = running.get(profileId);
   return inst ? publicInfo(inst) : null;
@@ -1493,6 +1497,7 @@ module.exports = {
   evaluateInProbePage,
   exportCookies,
   importCookies,
+  getInstance,
   getRunning,
   listRunning,
   buildInjectionSource,

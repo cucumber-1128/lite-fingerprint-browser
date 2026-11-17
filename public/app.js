@@ -1,6 +1,6 @@
 'use strict';
 
-let state = { profiles: [], browserPath: '', timezones: {}, presets: [], webglPool: [], screenPool: [] };
+let state = { profiles: [], browserPath: '', agentCli: null, timezones: {}, presets: [], webglPool: [], screenPool: [] };
 let editingId = null;
 let lastAutoAvail = 1040;
 let pendingGeo = undefined;
@@ -985,6 +985,62 @@ $('#btnSyncGeo').addEventListener('click', async () => {
   } finally {
     btn.disabled = false;
     btn.textContent = '测代理并对齐地区';
+  }
+});
+
+function openAgentGuide() {
+  const cli = state.agentCli || { command: 'fb.exe', mcpArgs: ['mcp'], isPackaged: true };
+  const q = (s) => (/\s/.test(String(s)) ? '"' + String(s) + '"' : String(s));
+  const fullCmd = [cli.command, ...(cli.mcpArgs || ['mcp'])].map(q).join(' ');
+  const bin = cli.isPackaged ? q(cli.command) : 'node src/index.js';
+
+  $('#codeClaude').textContent = 'claude mcp add lite-fingerprint -- ' + fullCmd;
+  $('#codeCodex').textContent =
+    '[mcp_servers.lite-fingerprint]\ncommand = ' +
+    JSON.stringify(cli.command) +
+    '\nargs = ' +
+    JSON.stringify(cli.mcpArgs || ['mcp']);
+  $('#codeMcpJson').textContent = JSON.stringify(
+    {
+      mcpServers: {
+        'lite-fingerprint': {
+          command: cli.command,
+          args: cli.mcpArgs || ['mcp'],
+        },
+      },
+    },
+    null,
+    2
+  );
+  $('#codeCli').textContent = [
+    '# 1) 查看并启动环境',
+    bin + ' list --json',
+    bin + ' launch <id> --json',
+    '',
+    '# 2) 打开网页并提取页面正文与 @e1/@e2 可交互元素引用',
+    bin + ' goto <id> https://example.com/signup --json',
+    bin + ' snapshot <id> --json',
+    '',
+    '# 3) 用原生可信事件操控元素；遇到人机验证 (blockedByChallenge=true) 停手并切到前台请人工完成',
+    bin + ' fill <id> @e1 "alice@example.com" --json',
+    bin + ' click <id> @e2 --json',
+    bin + ' focus <id> --json',
+  ].join('\n');
+  $('#agentDlg').showModal();
+}
+
+$('#btnAgentGuide').addEventListener('click', openAgentGuide);
+$('#btnCloseAgent').addEventListener('click', () => $('#agentDlg').close());
+$('#agentDlg').addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-copy-target]');
+  if (!btn) return;
+  const el = document.querySelector(btn.dataset.copyTarget);
+  if (!el) return;
+  try {
+    await navigator.clipboard.writeText(el.textContent);
+    toast('已复制到剪贴板');
+  } catch {
+    toast('复制失败，请手动选中复制', true);
   }
 });
 
