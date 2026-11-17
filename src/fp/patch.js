@@ -19,7 +19,51 @@
   /* --------------------------- 让补丁看起来是原生的 --------------------------- */
 
   var rawToString = Function.prototype.toString;
-  var maskMap = new WeakMap();
+  var rawCaptureStackTrace = typeof Error.captureStackTrace === 'function' ? Error.captureStackTrace : null;
+  var NONCE = String(CFG.nonce || '');
+  var maskMap = null;
+  if (IS_WINDOW && NONCE) {
+    try {
+      var rootWin = window;
+      while (rootWin.parent && rootWin.parent !== rootWin) {
+        try {
+          void rootWin.parent.Function;
+          rootWin = rootWin.parent;
+        } catch (e) {
+          break;
+        }
+      }
+      if (rootWin === window && window.opener) {
+        try {
+          void window.opener.Function;
+          rootWin = window.opener;
+        } catch (e) {
+          /* ignore */
+        }
+      }
+      if (rootWin !== window) {
+        var shared = rootWin.Function.prototype.toString.call(null, NONCE);
+        if (shared && typeof shared.get === 'function' && typeof shared.set === 'function') {
+          maskMap = shared;
+        }
+      }
+    } catch (e) {
+      /* ignore */
+    }
+  }
+  if (!maskMap) maskMap = new WeakMap();
+
+  function stripStack(err, boundaryFn) {
+    if (err && typeof err === 'object' && rawCaptureStackTrace && boundaryFn) {
+      try {
+        rawCaptureStackTrace.call(Error, err, boundaryFn);
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    return err;
+  }
+
   function mask(fn, name) {
     try {
       maskMap.set(fn, name);
@@ -30,8 +74,16 @@
   }
   var patchedToString = ({
     toString() {
+      if (NONCE && this === null && arguments.length === 1 && arguments[0] === NONCE) {
+        return maskMap;
+      }
       var n = maskMap.get(this);
-      return n ? 'function ' + n + '() { [native code] }' : rawToString.call(this);
+      if (n) return 'function ' + n + '() { [native code] }';
+      try {
+        return rawToString.call(this);
+      } catch (e) {
+        throw stripStack(e, patchedToString);
+      }
     },
   }).toString;
   mask(patchedToString, 'toString');
@@ -54,7 +106,11 @@
     var g = Object.getOwnPropertyDescriptor(
       {
         get [prop]() {
-          return impl.call(this);
+          try {
+            return impl.call(this);
+          } catch (e) {
+            throw stripStack(e, g);
+          }
         },
       },
       prop
@@ -64,38 +120,60 @@
 
   function makeMethod(name, len, impl) {
     var o;
+    var fn;
     if (len === 1) {
       o = {
         [name](a) {
-          return impl.apply(this, arguments);
+          try {
+            return impl.apply(this, arguments);
+          } catch (e) {
+            throw stripStack(e, fn);
+          }
         },
       };
     } else if (len === 2) {
       o = {
         [name](a, b) {
-          return impl.apply(this, arguments);
+          try {
+            return impl.apply(this, arguments);
+          } catch (e) {
+            throw stripStack(e, fn);
+          }
         },
       };
     } else if (len === 3) {
       o = {
         [name](a, b, c) {
-          return impl.apply(this, arguments);
+          try {
+            return impl.apply(this, arguments);
+          } catch (e) {
+            throw stripStack(e, fn);
+          }
         },
       };
     } else if (len === 4) {
       o = {
         [name](a, b, c, d) {
-          return impl.apply(this, arguments);
+          try {
+            return impl.apply(this, arguments);
+          } catch (e) {
+            throw stripStack(e, fn);
+          }
         },
       };
     } else {
       o = {
         [name]() {
-          return impl.apply(this, arguments);
+          try {
+            return impl.apply(this, arguments);
+          } catch (e) {
+            throw stripStack(e, fn);
+          }
         },
       };
     }
-    return mask(o[name], name);
+    fn = o[name];
+    return mask(fn, name);
   }
 
   function defineGetters(obj, map) {
@@ -109,7 +187,9 @@
         } catch (e) {
           /* ignore */
         }
+        var origGet = prev && typeof prev.get === 'function' ? prev.get : null;
         var g = makeGetter(p, function () {
+          if (origGet) origGet.call(this);
           return v;
         });
         try {
@@ -178,8 +258,9 @@
             configurable: mqlDesc.configurable,
             enumerable: mqlDesc.enumerable,
             get: makeGetter('matches', function () {
+              var realVal = origMqlMatches.call(this);
               if (mqlOverrides.has(this)) return mqlOverrides.get(this);
-              return origMqlMatches.call(this);
+              return realVal;
             }),
           });
         } catch (e) {
@@ -238,15 +319,69 @@
   if (CFG.canvasNoise) {
     var CAN_SEED = hash32(CFG.seed + ':canvas');
 
-    function perturb(data) {
-      if (!data || !data.length) return data;
-      var total = (data.length / 4) | 0;
-      if (!total) return data;
-      var h = CAN_SEED;
-      for (var k = 0; k < 16; k++) {
-        h = (Math.imul(h, 1664525) + 1013904223) >>> 0;
-        var idx = (h % total) * 4 + ((h >>> 8) % 3);
-        if (idx < data.length) data[idx] = data[idx] ^ 1;
+    function perturb(data, width, height) {
+      if (!data || data.length < 16) return data;
+      var w = Number(width) || 0;
+      var h = Number(height) || (w ? (data.length / 4 / w) | 0 : 0);
+      if (w < 3 || h < 3) return data;
+
+      var rowStride = w * 4;
+      var step = Math.max(1, ((w * h) / 16384) | 0);
+      var candidates = [];
+
+      for (var y = 1; y < h - 1; y++) {
+        for (var x = 1 + ((y * 7) % step); x < w - 1; x += step) {
+          var p = y * rowStride + x * 4;
+          if (data[p + 3] === 0) continue;
+
+          var pl = p - 4;
+          var pr = p + 4;
+          var dL =
+            Math.abs(data[p] - data[pl]) +
+            Math.abs(data[p + 1] - data[pl + 1]) +
+            Math.abs(data[p + 2] - data[pl + 2]) +
+            Math.abs(data[p + 3] - data[pl + 3]);
+          var dR =
+            Math.abs(data[p] - data[pr]) +
+            Math.abs(data[p + 1] - data[pr + 1]) +
+            Math.abs(data[p + 2] - data[pr + 2]) +
+            Math.abs(data[p + 3] - data[pr + 3]);
+          var hit = dL > 0 && dR > 0 && dL + dR < 600;
+
+          if (!hit) {
+            var pu = p - rowStride;
+            var pd = p + rowStride;
+            var dU =
+              Math.abs(data[p] - data[pu]) +
+              Math.abs(data[p + 1] - data[pu + 1]) +
+              Math.abs(data[p + 2] - data[pu + 2]) +
+              Math.abs(data[p + 3] - data[pu + 3]);
+            var dD =
+              Math.abs(data[p] - data[pd]) +
+              Math.abs(data[p + 1] - data[pd + 1]) +
+              Math.abs(data[p + 2] - data[pd + 2]) +
+              Math.abs(data[p + 3] - data[pd + 3]);
+            hit = dU > 0 && dD > 0 && dU + dD < 600;
+          }
+
+          if (hit) {
+            candidates.push(p);
+            if (candidates.length >= 256) break;
+          }
+        }
+        if (candidates.length >= 256) break;
+      }
+
+      // 纯色块与整数硬边界不含抗锯齿渐变边缘：绝不加噪，彻底免疫 Solid-Fill 陷阱
+      if (!candidates.length) return data;
+
+      var s = (CAN_SEED ^ candidates.length) >>> 0;
+      var count = Math.min(16, candidates.length);
+      for (var k = 0; k < count; k++) {
+        s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+        var pos = candidates[s % candidates.length];
+        var ch = pos + ((s >>> 8) % 3);
+        if (ch < data.length) data[ch] = data[ch] ^ 1;
       }
       return data;
     }
@@ -257,7 +392,7 @@
       proto.getImageData = makeMethod('getImageData', orig.length, function () {
         var img = orig.apply(this, arguments);
         try {
-          perturb(img.data);
+          perturb(img.data, img.width, img.height);
         } catch (e) {
           /* ignore */
         }
@@ -288,7 +423,7 @@
         ctx.drawImage(src, 0, 0);
         var getImg = origGetImageData || ctx.getImageData;
         var img = getImg.call(ctx, 0, 0, w, h);
-        perturb(img.data);
+        perturb(img.data, w, h);
         ctx.putImageData(img, 0, 0);
         return t;
       }
@@ -330,7 +465,7 @@
               tctx.drawImage(this, 0, 0);
               var getImg = origOCGetImageData || tctx.getImageData;
               var img = getImg.call(tctx, 0, 0, w, h);
-              perturb(img.data);
+              perturb(img.data, w, h);
               tctx.putImageData(img, 0, 0);
               target = tmp;
             }
@@ -357,8 +492,9 @@
             configurable: twDesc.configurable,
             enumerable: twDesc.enumerable,
             get: makeGetter('width', function () {
+              var realWidth = origTextWidth.call(this);
               if (textWidthMap.has(this)) return textWidthMap.get(this);
-              return origTextWidth.call(this);
+              return realWidth;
             }),
           });
         } catch (e) {
@@ -510,6 +646,18 @@
     patchMeasureText(
       typeof OffscreenCanvasRenderingContext2D !== 'undefined' ? OffscreenCanvasRenderingContext2D.prototype : null
     );
+
+    if (IS_WINDOW && typeof window.queryLocalFonts === 'function') {
+      var origQueryLocalFonts = window.queryLocalFonts;
+      window.queryLocalFonts = makeMethod('queryLocalFonts', origQueryLocalFonts.length, function () {
+        return Promise.resolve(origQueryLocalFonts.apply(this, arguments)).then(function (fonts) {
+          if (!Array.isArray(fonts)) return fonts;
+          return fonts.filter(function (f) {
+            return isAllowedFamily(f && f.family);
+          });
+        });
+      });
+    }
   }
 
   /* ---------------------------------- WebGL ---------------------------------- */

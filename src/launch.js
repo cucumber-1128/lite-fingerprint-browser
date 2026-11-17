@@ -335,12 +335,13 @@ function deriveFakeIp(seed) {
 }
 
 /** 组装注入脚本用的配置（probe 的期望值也用它，避免两处各算一套） */
-function buildConfig(profile) {
+function buildConfig(profile, nonce) {
   const REAL_PLATFORM = { win32: 'win', darwin: 'mac', linux: 'linux' }[process.platform] || 'linux';
   const platform = profile.platform || 'win';
   const scr = store.normalizeScreen(profile.screen || {}, platform);
   return {
     seed: profile.seed || 'seed',
+    nonce: nonce || crypto.randomBytes(16).toString('hex'),
     platform,
     realPlatform: REAL_PLATFORM,
     locale: profile.locale || 'zh-CN',
@@ -368,7 +369,8 @@ function buildConfig(profile) {
 function buildInjectionSource(profile) {
   const tpl = runtime.readAsset('src/fp/patch.js');
   if (!tpl) throw new Error('找不到注入脚本 src/fp/patch.js（打包时漏了？）');
-  const cfg = buildConfig(profile);
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const cfg = buildConfig(profile, nonce);
   // 用函数式替换：JSON 里若出现 $& / $1 之类，字符串替换会被当成替换模式
   const src = tpl.replace('__CFG__', () => JSON.stringify(cfg));
   // 占位符必须被完全替换掉，否则注入脚本会抛 ReferenceError 并静默失效
@@ -824,6 +826,9 @@ async function launch(profileId, options = {}) {
     '--window-position=' + posX + ',' + posY,
     '--lang=' + (profile.languages && profile.languages[0] ? profile.languages[0] : 'zh-CN'),
   ];
+  if (profile.platform === 'mac' || profile.platform === 'linux') {
+    args.push('--enable-features=OverlayScrollbar');
+  }
   if (relay) {
     args.push('--proxy-server=http://127.0.0.1:' + relay.port);
   }

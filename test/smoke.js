@@ -500,6 +500,42 @@ async function browserChecks() {
           await new Promise((r) => setTimeout(r, 400));
           voices = speechSynthesis.getVoices();
         }
+        // 1) 跨 realm iframe toString（含 iframe 移除后双向检测）
+        const ifr = document.createElement('iframe');
+        document.body.appendChild(ifr);
+        const ifrToString = ifr.contentWindow.Function.prototype.toString;
+        const ifrToDataURL = ifr.contentWindow.HTMLCanvasElement.prototype.toDataURL;
+        const crossRealmToStr = ifrToString.call(HTMLCanvasElement.prototype.toDataURL);
+        ifr.remove();
+        const reverseToStrAfterRemove = Function.prototype.toString.call(ifrToDataURL);
+
+        // 2) Illegal invocation 与调用栈清洗
+        let hcGetterThrows = false;
+        try {
+          hcDesc.get.call({});
+        } catch (e) {
+          hcGetterThrows = e instanceof TypeError;
+        }
+        let nullCallStack = '';
+        try {
+          HTMLCanvasElement.prototype.toDataURL.call(null);
+        } catch (e) {
+          nullCallStack = String(e.stack || e);
+        }
+
+        // 3) Canvas 纯色块陷阱（16x16 纯色矩形必须 0 噪点）
+        const sc = document.createElement('canvas');
+        sc.width = 16;
+        sc.height = 16;
+        const sctx = sc.getContext('2d');
+        sctx.fillStyle = '#123456';
+        sctx.fillRect(0, 0, 16, 16);
+        const sd = sctx.getImageData(0, 0, 16, 16).data;
+        let solidCorrupted = 0;
+        for (let i = 0; i < sd.length; i += 4) {
+          if (sd[i] !== 0x12 || sd[i + 1] !== 0x34 || sd[i + 2] !== 0x56) solidCorrupted++;
+        }
+
         return JSON.stringify({
           hcGetterHasProto: hcDesc && hcDesc.get ? ('prototype' in hcDesc.get) : null,
           hcGetterName: hcDesc && hcDesc.get ? hcDesc.get.name : null,
@@ -512,7 +548,12 @@ async function browserChecks() {
           uaChFullLen: uaCh && uaCh.fullVersionList ? uaCh.fullVersionList.length : 0,
           speechLeakCn: voices.some((v) => /Chinese \\(Simplified|Huihui|Kangkang|Yaoyao/i.test(String(v.name))),
           speechAllInstance: voices.every((v) => v instanceof SpeechSynthesisVoice),
-          matchDeviceWidth: matchMedia('(device-width: 2560px)').matches
+          matchDeviceWidth: matchMedia('(device-width: 2560px)').matches,
+          crossRealmToStr,
+          reverseToStrAfterRemove,
+          hcGetterThrows,
+          nullCallStack,
+          solidCorrupted
         });
       })()`
     );
@@ -540,6 +581,23 @@ async function browserChecks() {
     eq(audit.speechLeakCn, false, 'Windows en-US 环境 speechSynthesis 不泄露中文 SAPI 语音');
     eq(audit.speechAllInstance, true, 'speechSynthesis 语音对象保持 SpeechSynthesisVoice 实例');
     eq(audit.matchDeviceWidth, true, 'matchMedia(device-width: 2560px) 与伪装屏幕一致');
+    eq(
+      audit.crossRealmToStr,
+      'function toDataURL() { [native code] }',
+      '跨 realm iframe 调用 Function.prototype.toString 仍返回 [native code]'
+    );
+    eq(
+      audit.reverseToStrAfterRemove,
+      'function toDataURL() { [native code] }',
+      'iframe 移除后父窗口反向调用 toString 仍返回 [native code]'
+    );
+    eq(audit.hcGetterThrows, true, '非法 receiver 调用 getter 会抛出原生 TypeError: Illegal invocation');
+    ok(
+      audit.nullCallStack.includes('TypeError') && !audit.nullCallStack.includes('at toDataURL (<anonymous>:'),
+      '异常调用栈已清洗，不暴露注入层包装帧',
+      audit.nullCallStack
+    );
+    eq(audit.solidCorrupted, 0, 'Canvas 纯色块无像素被扰动（免疫 Solid-Fill 陷阱）');
 
     // 第二个环境：指纹必须完全不同
     t0 = Date.now();
@@ -664,6 +722,20 @@ async function headerChecks() {
     } else {
       console.log('     （本机 WebGPU 不可用，跳过 GPU 一致性断言）');
     }
+
+    const macAuditRaw = await launcher.evaluateInProbePage(
+      p.id,
+      `(() => {
+        const sb = document.createElement('div');
+        sb.style.cssText = 'width:100px;height:100px;overflow:scroll;position:absolute;top:-9999px';
+        document.body.appendChild(sb);
+        const scrollbarWidth = sb.offsetWidth - sb.clientWidth;
+        sb.remove();
+        return JSON.stringify({ scrollbarWidth });
+      })()`
+    );
+    const macAudit = JSON.parse(macAuditRaw);
+    eq(macAudit.scrollbarWidth, 0, 'macOS 环境启用原生 OverlayScrollbar，滚动条宽度为 0px');
   } catch (e) {
     ok(false, '请求头测试异常: ' + e.message);
   } finally {
