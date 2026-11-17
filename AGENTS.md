@@ -1,18 +1,38 @@
 # 给 agent 的操作说明
 
-这是一个零依赖的本地指纹浏览器。所有操作都能用 CLI 完成，**全部支持 `--json`**：
+用户丢过来的通常是安装目录里的 exe，不是这份源码。先按下面做，不要去翻二进制、解包、读 `store.js` 再手写 `profiles.json`。
 
-- `--json` 时 stdout 只有一段 JSON，退出码 `0` 成功 / `1` 失败；
-- 失败时结构是 `{"ok":false,"error":"..."}`，成功时至少带 `"ok":true`；
-- 不弹任何交互式提示，不需要 TTY。
+安装目录：
 
-入口：
-
-```bash
-node src/index.js <命令> [选项] --json
+```text
+LiteFingerprint.exe   窗口。不接受 create/list，传参数也不会转给后台
+fb.exe                CLI，就是打包后的这个程序
+AGENTS.md             本文件。安装目录里也放一份
+ data/                 环境数据。跟 fb.exe 走，不要另设 FB_DATA
 ```
 
-打包成客户端后，把 `node src/index.js` 换成 `LiteFingerprint.exe` 即可（同一个 CLI）。
+在安装目录里执行（源码仓库里把 `fb.exe` 换成 `node src/index.js`）：
+
+```text
+fb.exe doctor --json
+fb.exe presets --json
+fb.exe create --preset us-west --count 3 --name 美西 --json
+fb.exe list --json
+```
+
+用户给了一个 IP，要求「按这个 IP 建环境」：
+
+1. `fb.exe presets --json` 已经带时区，不要读源码里的预设表。
+2. 用 IP 的公开地理位置对时区，选预设：美西 `us-west`，美东 `us-shop`，英国 `uk-shop`，德国 `de-shop`，日本 `jp-shop`，台湾 `tw-shop`，中国 `cn-shop`。
+3. 用户没给代理，就不要加 `--proxy`。出口就是本机。屏幕、CPU、显卡不用填。
+
+不要做：
+
+- 不要对 `LiteFingerprint.exe` 传 CLI 参数。它只拉窗口，参数会被丢掉。
+- 不要在源码仓库里跑 `node src/index.js create` 再把结果拷贝安装目录。那会写进仓库自己的 `data/`。
+- 不要解包 `fb.exe`。命令就是上面那些。
+
+所有命令都支持 `--json`：stdout 只有一段 JSON，退出码 `0` 成功 / `1` 失败；失败是 `{"ok":false,"error":"..."}`；不弹交互提示。`fb.exe help` 和 `fb.exe --help` 都只打帮助，不会把控制台又起一个。
 
 ---
 
@@ -31,6 +51,7 @@ node src/index.js <命令> [选项] --json
 | 「复制一份改个名」 | `node src/index.js clone <id> --name 店铺B --json` |
 | 「把配置导出来备份」 | `node src/index.js export backup.json --json` |
 | 「在新机器上恢复」 | `node src/index.js import backup.json --json` |
+| 「按我这个 IP 建 3 个」 | 先 `fb.exe presets --json` 对时区，再 `fb.exe create --preset us-west --count 3 --name 美西 --json`（美西才是 us-west；没给代理就不要加 --proxy） |
 | 「环境不对劲，先自检」 | `node src/index.js doctor --json` |
 
 ---

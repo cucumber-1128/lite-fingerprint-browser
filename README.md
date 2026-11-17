@@ -82,6 +82,7 @@ npm run client:build   # → src-tauri/target/release/bundle/nsis/LiteFingerprin
 - sidecar 由 `npm run client:prepare` 生成：先跑 SEA 打包，再按 Tauri 的命名规则复制成 `src-tauri/binaries/fb-<target-triple>.exe`。
 - 关窗口时壳子退出 → sidecar 的 stdin 关闭 → 优雅关掉已启动的环境。
 - 体积：Tauri 壳约 5 MB + Node sidecar 约 87 MB ≈ **92 MB**；换来的是正规安装包、图标、没有黑窗口控制台，也方便以后加托盘和自动更新。
+- 安装目录根上有 `AGENTS.md`（和 `fb.exe` 一起）。agent 对着安装目录就能配环境，不用先找源码。
 
 本机装不了工具链的话，可以走 GitHub Actions：在 Actions 里手动跑 `build-client`，或推一个 `v*` tag，产物在 Artifacts 里（`LiteFingerprint_*_x64-setup.exe`）。
 

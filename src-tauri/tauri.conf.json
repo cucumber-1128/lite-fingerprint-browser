@@ -18,12 +18,16 @@
     "targets": ["nsis"],
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
     "externalBin": ["binaries/fb"],
+    "resources": {
+      "../AGENTS.md": "AGENTS.md"
+    },
     "shortDescription": "轻量指纹浏览器",
     "longDescription": "复用本机 Chrome/Edge 的轻量指纹浏览器：独立环境、指纹伪装、独立代理。",
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["SimpChinese", "English"]
+        "languages": ["SimpChinese", "English"],
+        "installerHooks": "nsis/hooks.nsh"
       }
     }
   }

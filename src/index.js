@@ -27,7 +27,8 @@ const { PRESETS, getPreset, parseProxyLine, parseProxies, readJsonArg } = requir
 
 const argv = process.argv.slice(2);
 const jsonMode = hasFlag('json');
-const cmd = argv[0] && !String(argv[0]).startsWith('--') ? String(argv[0]).toLowerCase() : 'serve';
+const first = argv[0] && !String(argv[0]).startsWith('--') ? String(argv[0]).toLowerCase() : '';
+const cmd = first || (argv.includes('--help') || argv.includes('-h') ? 'help' : 'serve');
 
 /* -------------------------------- 参数工具 -------------------------------- */
 
@@ -377,6 +378,9 @@ async function cmdDoctor() {
 function printHelp() {
   const lines = [
     '轻量指纹浏览器 · CLI',
+    '',
+    '  安装目录里跑 fb.exe，不要跑 LiteFingerprint.exe（那个只是窗口，参数不会进 CLI）。',
+    '  数据在 exe 旁边的 data/。完整说明见同目录或源码仓库的 AGENTS.md。',
     '',
     '  node src/index.js [serve] [--port N] [--no-open]   启动控制台（默认）',
     '  node src/index.js list [--json]                    列出环境',
