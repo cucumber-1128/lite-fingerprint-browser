@@ -157,7 +157,7 @@ function wireTunnel(sock, clientSocket) {
   sock.on('close', () => clientSocket.destroy());
 }
 
-function httpProxyConnect(upstream, targetHost, targetPort) {
+function httpProxyConnect(upstream, targetHost, targetPort, useHttp11 = upstream.type === 'https') {
   return new Promise((resolve, reject) => {
     let sock = null;
     let buf = Buffer.alloc(0);
@@ -171,8 +171,11 @@ function httpProxyConnect(upstream, targetHost, targetPort) {
     };
 
     sock = connectUpstreamSocket(upstream, () => {
-      const hostPort = targetHost + ':' + targetPort;
-      const lines = ['CONNECT ' + hostPort + ' HTTP/1.1', 'Host: ' + hostPort];
+      const hostPort = (net.isIPv6(targetHost) ? '[' + targetHost + ']' : targetHost) + ':' + targetPort;
+      // Some HTTP upstreams stall when CONNECT repeats its authority in Host.
+      const lines = useHttp11
+        ? ['CONNECT ' + hostPort + ' HTTP/1.1', 'Host: ' + hostPort]
+        : ['CONNECT ' + hostPort + ' HTTP/1.0'];
       if (upstream.username) {
         lines.push('Proxy-Authorization: ' + basicAuth(upstream.username, upstream.password));
       }
@@ -195,6 +198,12 @@ function httpProxyConnect(upstream, targetHost, targetPort) {
       const m = /^HTTP\/1\.[01]\s+(\d{3})/.exec(first);
       if (!m) return fail('上游代理响应无法解析：' + first);
       const code = Number(m[1]);
+      if (!useHttp11 && (code === 400 || code === 505 || code === 426)) {
+        settled = true;
+        sock.destroy();
+        resolve(httpProxyConnect(upstream, targetHost, targetPort, true));
+        return;
+      }
       if (code !== 200) {
         const isAuth = code === 407 || code === 401;
         return fail('上游代理拒绝连接（' + code + '）' + (isAuth ? '：请检查代理账号密码' : ''));
@@ -474,7 +483,7 @@ function fetchJson(url, relayPort, timeoutMs) {
         timeout: timeoutMs,
       };
       if (socket) {
-        opts.agent = false;
+        // agent: false creates a new Agent and ignores this connected tunnel.
         opts.createConnection = () => socket;
       }
       const req = (socket ? http : https).request(opts, (res) => {
