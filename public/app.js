@@ -370,13 +370,13 @@ async function saveEditor() {
     $('#editorErr').textContent = '请填名称';
     return;
   }
-  if (data.screen.width <= 0 || data.screen.height <= 0 || data.screen.availHeight <= 0) {
-    $('#editorErr').textContent = '屏幕宽高和可用高必须大于 0';
+  if (Number(getVal('pixelRatio')) <= 0) {
+    $('#editorErr').textContent = 'DPR 必须大于 0';
     return;
   }
   if (data.screen.availHeight > data.screen.height || data.screen.height - data.screen.availHeight > 160) {
-    const bar = data.platform === 'mac' ? 25 : 40;
-    data.screen.availHeight = Math.max(200, data.screen.height - bar);
+    $('#editorErr').textContent = '可用高须在 ' + Math.max(1, data.screen.height - 160) + ' 到 ' + data.screen.height + ' 之间';
+    return;
   }
   if (data.proxy.type !== 'none' && (!data.proxy.host || !data.proxy.port)) {
     $('#editorErr').textContent = '选了代理就要填主机和端口';
@@ -384,11 +384,12 @@ async function saveEditor() {
   }
   $('#btnSave').disabled = true;
   try {
-    if (editingId) await api('/api/profiles/' + editingId, { method: 'PUT', body: data });
-    else await api('/api/profiles', { method: 'POST', body: data });
+    const saved = editingId
+      ? await api('/api/profiles/' + editingId, { method: 'PUT', body: data })
+      : await api('/api/profiles', { method: 'POST', body: data });
     $('#editor').close();
     await load();
-    toast('已保存');
+    toast(saved.running ? '已保存，浏览器参数将在下次启动此环境时生效' : '已保存');
   } catch (e) {
     $('#editorErr').textContent = e.message;
   } finally {
@@ -576,7 +577,10 @@ document.addEventListener('click', (e) => {
 $('#btnNew').addEventListener('click', () => openEditor(null));
 $('#btnRefresh').addEventListener('click', () => load(true));
 $('#btnCancel').addEventListener('click', () => $('#editor').close());
-$('#btnSave').addEventListener('click', saveEditor);
+$('#editorForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  if (!$('#btnSave').disabled) saveEditor();
+});
 $('#btnCloseReport').addEventListener('click', () => $('#report').close());
 $('#btnCloseProxy').addEventListener('click', () => $('#proxyDlg').close());
 $('#editorForm').querySelector('[name="userAgentMode"]').addEventListener('change', syncUaWrap);

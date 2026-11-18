@@ -99,17 +99,17 @@
     </div>
 
     <div class="row four">
-      <label>屏宽<input name="screenWidth" type="number" /></label>
-      <label>屏高<input name="screenHeight" type="number" /></label>
-      <label>可用高<input name="screenAvailHeight" type="number" /></label>
-      <label>DPR<input name="pixelRatio" type="number" step="0.25" /></label>
+      <label>屏宽<input name="screenWidth" type="number" min="1" required /></label>
+      <label>屏高<input name="screenHeight" type="number" min="1" required /></label>
+      <label>可用高<input name="screenAvailHeight" type="number" min="1" required /></label>
+      <label>DPR<input name="pixelRatio" type="number" step="any" required /></label>
     </div>
 
     <div class="row four">
-      <label>CPU 核数<input name="hardwareConcurrency" type="number" /></label>
-      <label>内存 GB<input name="deviceMemory" type="number" min="1" max="8" title="规范上限是 8" /></label>
-      <label>触点数<input name="maxTouchPoints" type="number" /></label>
-      <label>色深<input name="colorDepth" type="number" /></label>
+      <label>CPU 核数<input name="hardwareConcurrency" type="number" min="1" required /></label>
+      <label>网页可见内存（1–8 GB）<input name="deviceMemory" type="number" step="any" min="1" max="8" required /></label>
+      <label>触点数<input name="maxTouchPoints" type="number" min="0" required /></label>
+      <label>色深<input name="colorDepth" type="number" min="1" required /></label>
     </div>
 
     <div class="row">
@@ -176,7 +176,7 @@
     <footer>
       <span class="err" id="editorErr"></span>
       <button type="button" class="btn ghost" id="btnCancel">取消</button>
-      <button type="button" class="btn primary" id="btnSave">保存</button>
+      <button type="submit" class="btn primary" id="btnSave">保存</button>
     </footer>
   </form>
 </dialog>
