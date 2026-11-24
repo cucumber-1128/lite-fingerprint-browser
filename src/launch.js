@@ -503,7 +503,9 @@ function devToolsPortConflict(logPath, startOffset) {
     const start = Math.max(startOffset, size - 65536);
     const buf = Buffer.alloc(Math.max(0, size - start));
     if (buf.length) fs.readSync(fd, buf, 0, buf.length, start);
-    return /address already in use|eaddrinuse|failed to bind.*(?:debug|port)|cannot bind.*(?:debug|port)/i.test(buf.toString('utf8'));
+    const logText = buf.toString('utf8');
+    return /address already in use|eaddrinuse|failed to bind.*(?:debug|port)|cannot bind.*(?:debug|port)/i.test(logText) ||
+      /bind\(\) returned an error:\s*only one usage of each socket address\b/i.test(logText);
   } catch {
     return false;
   } finally {

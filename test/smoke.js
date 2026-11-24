@@ -540,30 +540,42 @@ if (process.argv.includes('--version')) {
 }
 const port = Number(process.argv.find((arg) => arg.startsWith('--remote-debugging-port=')).split('=')[1]);
 fs.appendFileSync(process.env.FB_PORT_RETRY_FILE, port + '\\n');
-const server = http.createServer((req, res) => {
-  if (req.url === '/json/version') {
-    fs.appendFileSync(process.env.FB_PORT_FOREIGN_QUERIES_FILE, 'queried\\n');
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ webSocketDebuggerUrl: 'ws://127.0.0.1:' + port + '/devtools/browser/foreign-listener' }));
-    return;
-  }
-  res.writeHead(404).end();
-});
-const reportBindFailure = () => setTimeout(() => process.stderr.write('DevTools bind failed: Address already in use\\n'), 250);
-server.once('error', reportBindFailure);
-server.listen(port, '127.0.0.1', reportBindFailure);
+if (process.env.FB_PORT_GENERIC_FAILURE === '1') {
+  process.stderr.write('Cannot start http server for devtools.\\n');
+  process.exitCode = 1;
+} else {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/json/version') {
+      fs.appendFileSync(process.env.FB_PORT_FOREIGN_QUERIES_FILE, 'queried\\n');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ webSocketDebuggerUrl: 'ws://127.0.0.1:' + port + '/devtools/browser/foreign-listener' }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  const reportBindFailure = () => setTimeout(() => process.stderr.write(
+    'bind() returned an error: Only one usage of each socket address (protocol/network address/port) is normally permitted. (0x2740)\\n' +
+    'bind() returned an error: Only one usage of each socket address (protocol/network address/port) is normally permitted. (0x2740)\\n' +
+    'Cannot start http server for devtools.\\n'
+  ), 250);
+  server.once('error', reportBindFailure);
+  server.listen(port, '127.0.0.1', reportBindFailure);
+}
 `, { mode: 0o755 });
   const oldPath = process.env.FB_PORT_RETRY_FILE;
   const oldVersionCalls = process.env.FB_PORT_VERSION_CALLS_FILE;
   const oldForeignQueries = process.env.FB_PORT_FOREIGN_QUERIES_FILE;
+  const oldGenericFailure = process.env.FB_PORT_GENERIC_FAILURE;
+  delete process.env.FB_PORT_GENERIC_FAILURE;
   process.env.FB_PORT_RETRY_FILE = attemptsFile;
   process.env.FB_PORT_VERSION_CALLS_FILE = versionCallsFile;
   process.env.FB_PORT_FOREIGN_QUERIES_FILE = foreignQueriesFile;
   const profile = store.create({ name: 'port-retry-test' });
+  const genericProfile = store.create({ name: 'generic-devtools-error-test' });
   try {
     let error = null;
     try { await launcher.launch(profile.id, { chromePath: fakeBrowser }); } catch (e) { error = e; }
-    eq(error && error.code, 'DEVTOOLS_PORT_CONFLICT', '端口冲突错误被识别并在有界重试后返回');
+    eq(error && error.code, 'DEVTOOLS_PORT_CONFLICT', 'Windows Chrome socket-in-use 日志触发有界重试');
     const attemptedPorts = fs.existsSync(attemptsFile) ? fs.readFileSync(attemptsFile, 'utf8').trim().split('\n') : [];
     eq(attemptedPorts.length, 3, '端口绑定冲突最多启动尝试三次');
     eq(new Set(attemptedPorts).size, 3, '每次重试都为 DevTools 选择新的固定端口');
@@ -576,17 +588,31 @@ server.listen(port, '127.0.0.1', reportBindFailure);
     })));
     ok(portsReleased.every(Boolean), '冲突重试结束后所有模拟监听端口均已释放');
     eq(launcher.getRunning(profile.id), null, '冲突重试失败后没有残留运行实例');
+
+    fs.writeFileSync(attemptsFile, '');
+    process.env.FB_PORT_GENERIC_FAILURE = '1';
+    let genericError = null;
+    try { await launcher.launch(genericProfile.id, { chromePath: fakeBrowser }); } catch (e) { genericError = e; }
+    ok(!!genericError, '普通 DevTools HTTP server 启动错误仍然报告启动失败');
+    ok(genericError && genericError.code !== 'DEVTOOLS_PORT_CONFLICT', '普通 DevTools server 错误不会误触发端口重试');
+    const genericAttempts = fs.existsSync(attemptsFile) ? fs.readFileSync(attemptsFile, 'utf8').trim().split('\n').filter(Boolean) : [];
+    eq(genericAttempts.length, 1, '普通 DevTools server 错误仅启动一次');
+    eq(launcher.getRunning(genericProfile.id), null, '普通 DevTools server 错误后没有残留运行实例');
   } catch (e) {
     ok(false, 'DevTools 端口重试测试异常: ' + e.message);
   } finally {
     await launcher.stop(profile.id);
+    await launcher.stop(genericProfile.id);
     store.remove(profile.id);
+    store.remove(genericProfile.id);
     if (oldPath === undefined) delete process.env.FB_PORT_RETRY_FILE;
     else process.env.FB_PORT_RETRY_FILE = oldPath;
     if (oldVersionCalls === undefined) delete process.env.FB_PORT_VERSION_CALLS_FILE;
     else process.env.FB_PORT_VERSION_CALLS_FILE = oldVersionCalls;
     if (oldForeignQueries === undefined) delete process.env.FB_PORT_FOREIGN_QUERIES_FILE;
     else process.env.FB_PORT_FOREIGN_QUERIES_FILE = oldForeignQueries;
+    if (oldGenericFailure === undefined) delete process.env.FB_PORT_GENERIC_FAILURE;
+    else process.env.FB_PORT_GENERIC_FAILURE = oldGenericFailure;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
