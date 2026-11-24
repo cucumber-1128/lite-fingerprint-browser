@@ -34,14 +34,16 @@ body {
 }
 
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.brand h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+.brand h1 { flex: 0 0 auto; font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .3px; white-space: nowrap; }
 .brand .dot {
+  flex: 0 0 9px;
   width: 9px; height: 9px; border-radius: 50%;
   background: var(--accent);
   box-shadow: 0 0 10px var(--accent);
 }
 .brand .ver {
   color: var(--muted); font-size: 12px;
+  flex: 0 1 auto; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46vw;
 }
 
@@ -70,6 +72,37 @@ body {
 .btn.danger { color: var(--danger); border-color: #43272a; }
 .btn.danger:hover { background: #2a1618; border-color: #6b3033; }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+@media (max-width: 1200px) {
+  .top {
+    flex-wrap: wrap;
+  }
+
+  .brand { flex: 0 0 auto; }
+
+  .brand .ver { max-width: clamp(72px, 22vw, 220px); }
+
+  .actions {
+    flex: 1 1 560px;
+    min-width: 0;
+  }
+
+  .search,
+  .group-filter {
+    flex: 1 1 150px;
+    min-width: 0;
+    width: auto;
+  }
+}
+
+@media (max-width: 700px) {
+  .top { justify-content: flex-start; gap: 10px 12px; padding: 12px 16px; }
+
+  .brand,
+  .actions { flex: 1 1 100%; min-width: 0; }
+
+  .actions { justify-content: flex-start; }
+}
 
 main { padding: 20px 22px 60px; max-width: 1400px; margin: 0 auto; }
 
