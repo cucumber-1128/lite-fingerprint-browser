@@ -27,6 +27,7 @@ const { findBrowser } = browser;
 const { createServer } = require('../src/server');
 const { resolveCount } = require('../src/cliutil');
 const { profileConfigErrors, profileWarnings } = require('../src/profile-validation');
+const { reattachBrowserVersionFromChild } = require('./reattach-regression');
 
 let pass = 0;
 let skipped = 0;
@@ -1287,6 +1288,11 @@ async function browserChecks() {
     const infoA = await launcher.launch(a.id);
     ok(!!infoA.pid, '环境A启动成功（' + (Date.now() - t0) + 'ms，内核 ' + infoA.browserVersion + '）');
     cleanup.push(a.id);
+    eq(
+      reattachBrowserVersionFromChild(a.id),
+      infoA.browserVersion,
+      '控制进程重启后重接管保留 browserVersion'
+    );
     const consistentUa = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/' + infoA.browserVersion.split('.')[0] + '.0.0.0 Safari/537.36';
     const consistentProfile = store.create({ name: 'consistent-custom-ua', platform: 'win', userAgentMode: 'custom', userAgentCustom: consistentUa });
     eq(launcher.buildUserAgent(consistentProfile, infoA.browserVersion), consistentUa, '一致的自定义 UA 被原样保留而不自动改写');
