@@ -20,6 +20,7 @@ function candidates() {
     path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
     path.join(pf, 'Chromium', 'Application', 'chrome.exe'),
     '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser',
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
@@ -37,6 +38,31 @@ function candidates() {
     }
   } catch {
     /* ignore */
+  }
+
+  const pathNames = process.platform === 'win32'
+    ? ['chrome.exe', 'msedge.exe', 'chromium.exe']
+    : ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'chrome', 'microsoft-edge'];
+  const extensions = process.platform === 'win32'
+    ? String(process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';')
+    : [''];
+  for (const dir of String(process.env.PATH || '').split(path.delimiter).filter(Boolean)) {
+    for (const name of pathNames) {
+      for (const ext of extensions) {
+        const candidate = path.join(dir, process.platform === 'win32' && !path.extname(name) ? name + ext : name);
+        try {
+          if (fs.existsSync(candidate)) {
+            if (process.platform === 'win32') list.push(candidate);
+            else {
+              fs.accessSync(candidate, fs.constants.X_OK);
+              list.push(candidate);
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
   }
   return list;
 }

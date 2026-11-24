@@ -18,7 +18,7 @@ const DIST = path.join(ROOT, 'dist');
 const OUT_NAME = process.platform === 'win32' ? 'LiteFingerprint.exe' : 'lite-fingerprint';
 const SENTINEL = 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2';
 
-const MODULES = ['index', 'server', 'store', 'launch', 'cdp', 'proxy', 'browser', 'runtime', 'cliutil', 'agent', 'mcp'];
+const MODULES = ['index', 'server', 'store', 'launch', 'cdp', 'proxy', 'browser', 'runtime', 'cliutil', 'profile-validation', 'agent', 'mcp'];
 
 function readModules() {
   const out = {};

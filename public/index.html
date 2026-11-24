@@ -39,7 +39,7 @@
   <section class="grid" id="grid"></section>
   <section class="empty" id="empty" hidden>
     <p>还没有环境。</p>
-    <p>点右上角「新建环境」，每个环境有独立的 Cookie 存储、独立的指纹、独立的代理。</p>
+    <p>点右上角「新建环境」，每个环境有独立的 Cookie 存储和指纹配置；代理按环境配置，未配置时使用本机网络直连。</p>
   </section>
 </main>
 
@@ -133,7 +133,7 @@
       </label>
     </div>
 
-    <label class="full" id="uaWrap">自定义 UA
+    <label class="full" id="uaWrap">自定义 UA（平台和 Chromium 主版本必须与环境一致；推荐使用自动生成）
       <input name="userAgentCustom" placeholder="留空则自动生成" />
     </label>
 

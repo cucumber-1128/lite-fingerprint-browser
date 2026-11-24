@@ -11,7 +11,8 @@ const agent = require('./agent');
 const runtime = require('./runtime');
 const { testProxy } = require('./proxy');
 const { findBrowser } = require('./browser');
-const { PRESETS, getPreset, parseProxyLine, parseProxies, countryToLocale } = require('./cliutil');
+const { PRESETS, getPreset, parseProxyLine, parseProxies, countryToLocale, resolveCount } = require('./cliutil');
+const { profileWarnings } = require('./profile-validation');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -75,9 +76,9 @@ function serveStatic(req, res, pathname) {
   res.end(body);
 }
 
-function withRunning(profile) {
+function withRunning(profile, allProfiles = store.list()) {
   const info = launcher.getRunning(profile.id);
-  return { ...store.publicProfile(profile), running: !!info, instance: info };
+  return { ...store.publicProfile(profile), running: !!info, instance: info, warnings: profileWarnings(profile, allProfiles) };
 }
 
 function createServer(opts = {}) {
@@ -111,8 +112,13 @@ function createServer(opts = {}) {
       }
     }
 
-    const url = new URL(req.url, 'http://127.0.0.1');
-    const pathname = decodeURIComponent(url.pathname);
+    let pathname;
+    try {
+      const url = new URL(req.url, 'http://127.0.0.1');
+      pathname = decodeURIComponent(url.pathname);
+    } catch {
+      return json(res, 400, { error: '请求路径格式错误' });
+    }
 
     try {
       /* ------------------------------- API ------------------------------- */
@@ -130,8 +136,9 @@ function createServer(opts = {}) {
         if (method === 'GET' && pathname === '/api/state') {
           const browser = findBrowser();
           const entryScript = path.join(runtime.ROOT, 'src', 'index.js');
+          const profiles = store.list();
           return json(res, 200, {
-            profiles: store.list().map(withRunning),
+            profiles: profiles.map((profile) => withRunning(profile, profiles)),
             running: launcher.listRunning(),
             browserPath: browser,
             agentCli: globalThis.__FB_ASSETS__
@@ -255,7 +262,8 @@ function createServer(opts = {}) {
               : null;
           if (!items) return json(res, 400, { error: '导入文件里没有 profiles 数组' });
           const created = store.importAll(items);
-          return json(res, 200, { imported: created.length, profiles: created.map(withRunning) });
+          const allProfiles = store.list();
+          return json(res, 200, { imported: created.length, profiles: created.map((profile) => withRunning(profile, allProfiles)) });
         }
 
         if (method === 'POST' && pathname === '/api/profiles') {
@@ -280,8 +288,12 @@ function createServer(opts = {}) {
           } catch (e) {
             return json(res, 400, { error: e && e.message ? e.message : String(e) });
           }
-          const countRaw = Number(body.count);
-          const count = countRaw > 0 ? Math.min(100, Math.floor(countRaw)) : proxies.length || 1;
+          let count;
+          try {
+            count = resolveCount(Object.prototype.hasOwnProperty.call(body, 'count') ? body.count : undefined, proxies.length || 1);
+          } catch (e) {
+            return json(res, 400, { error: e.message });
+          }
           if (proxies.length && count > proxies.length) {
             return json(res, 400, {
               error: '代理只有 ' + proxies.length + ' 条，但数量为 ' + count + '（代理与环境必须一对一）',
@@ -289,7 +301,7 @@ function createServer(opts = {}) {
           }
           const baseName = String(body.name || '').trim() || (preset ? preset.label : '新环境');
           const group = String(body.group || '').trim() || (preset ? preset.label : '');
-          const created = [];
+          const fieldsList = [];
           for (let i = 0; i < count; i++) {
             const fields = {
               name: count > 1 ? baseName + '-' + (i + 1) : baseName,
@@ -303,9 +315,11 @@ function createServer(opts = {}) {
               fields.timezone = preset.timezone;
             }
             if (proxies[i]) fields.proxy = proxies[i];
-            created.push(store.create(fields));
+            fieldsList.push(fields);
           }
-          return json(res, 200, { ok: true, count: created.length, created: created.map(withRunning) });
+          const created = store.createMany(fieldsList);
+          const allProfiles = store.list();
+          return json(res, 200, { ok: true, count: created.length, created: created.map((profile) => withRunning(profile, allProfiles)) });
         }
 
         if (seg[0] === 'profiles' && seg[1]) {
@@ -449,7 +463,7 @@ function createServer(opts = {}) {
       }
       serveStatic(req, res, pathname);
     } catch (e) {
-      json(res, 500, { error: e && e.message ? e.message : String(e) });
+      json(res, e && e.code === 'PROFILE_CONFIG_INVALID' ? 400 : 500, { error: e && e.message ? e.message : String(e) });
     }
   });
 
