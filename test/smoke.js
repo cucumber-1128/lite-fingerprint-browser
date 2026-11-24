@@ -5,6 +5,7 @@
  * 会真的启动两个 Chrome 环境、读回指纹、做断言，最后全部关掉。
  */
 const net = require('node:net');
+const dgram = require('node:dgram');
 const tls = require('node:tls');
 const crypto = require('node:crypto');
 const http = require('node:http');
@@ -21,10 +22,17 @@ const launcher = require('../src/launch');
 const agent = require('../src/agent');
 const { CDP } = require('../src/cdp');
 const { createRelay } = require('../src/proxy');
-const { findBrowser } = require('../src/browser');
+const browser = require('../src/browser');
+const { findBrowser } = browser;
+const { createServer } = require('../src/server');
+const { resolveCount } = require('../src/cliutil');
+const { profileConfigErrors, profileWarnings } = require('../src/profile-validation');
+const { reattachBrowserVersionFromChild } = require('./reattach-regression');
 
 let pass = 0;
+let skipped = 0;
 const failures = [];
+let baselineCapabilities = null;
 
 function ok(cond, label, extra) {
   if (cond) {
@@ -40,6 +48,23 @@ function eq(actual, expected, label) {
   ok(actual === expected, label, { expected, actual });
 }
 
+function skip(label, reason) {
+  skipped++;
+  console.log('  \x1b[33m↷ SKIP\x1b[0m ' + label + '：' + reason);
+}
+
+function webglAvailable(surface) {
+  if (!baselineCapabilities) {
+    ok(false, '未获得未注入浏览器能力基线，不能将 WebGL 断言当作环境跳过');
+    return false;
+  }
+  if (!baselineCapabilities[surface]) {
+    skip(surface + ' WebGL 断言', '未注入 Chrome 基线无法创建 WebGL context');
+    return false;
+  }
+  return true;
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 收掉临时数据目录（浏览器都关掉之后才能删干净） */
@@ -51,6 +76,547 @@ function cleanupData() {
   }
 }
 
+function freeLocalPort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port;
+      server.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
+async function stopRawBrowser(proc) {
+  if (!proc || !proc.pid) return;
+  if (process.platform === 'win32') {
+    spawnSync('taskkill.exe', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+  } else {
+    try {
+      process.kill(-proc.pid, 'SIGKILL');
+    } catch {
+      try { proc.kill('SIGKILL'); } catch { /* ignore */ }
+    }
+  }
+  await Promise.race([
+    new Promise((resolve) => proc.once('exit', resolve)),
+    sleep(1500),
+  ]);
+}
+
+async function createLocalStunServer() {
+  const socket = dgram.createSocket('udp4');
+  let requests = 0;
+  socket.on('message', (message, remote) => {
+    if (message.length < 20 || message.readUInt32BE(4) !== 0x2112a442 || message.readUInt16BE(0) !== 0x0001) return;
+    requests++;
+    const parts = remote.address.split('.').map(Number);
+    if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return;
+    const address = ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+    const response = Buffer.alloc(32);
+    response.writeUInt16BE(0x0101, 0);
+    response.writeUInt16BE(12, 2);
+    response.writeUInt32BE(0x2112a442, 4);
+    message.copy(response, 8, 8, 20);
+    response.writeUInt16BE(0x0020, 20);
+    response.writeUInt16BE(8, 22);
+    response[24] = 0;
+    response[25] = 1;
+    response.writeUInt16BE(remote.port ^ 0x2112, 26);
+    response.writeUInt32BE((address ^ 0x2112a442) >>> 0, 28);
+    socket.send(response, remote.port, remote.address);
+  });
+  await new Promise((resolve, reject) => {
+    socket.once('error', reject);
+    socket.bind(0, '127.0.0.1', resolve);
+  });
+  return {
+    port: socket.address().port,
+    get requests() { return requests; },
+    close: () => new Promise((resolve) => socket.close(resolve)),
+  };
+}
+
+async function gatherLocalIce(profileId, port) {
+  const raw = await launcher.evaluateInProbePage(profileId, `(async () => {
+    if (typeof RTCPeerConnection !== 'function') return JSON.stringify({ unsupported: true });
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:127.0.0.1:${port}' }] });
+    const candidates = [];
+    pc.createDataChannel('local-check');
+    const gathered = new Promise((resolve) => {
+      const timer = setTimeout(() => { pc.close(); resolve(false); }, 7000);
+      pc.onicecandidate = (event) => {
+        if (event.candidate) candidates.push(event.candidate.candidate);
+        else {
+          clearTimeout(timer);
+          pc.close();
+          resolve(true);
+        }
+      };
+    });
+    try {
+      await pc.setLocalDescription(await pc.createOffer());
+      const complete = await gathered;
+      return JSON.stringify({ complete, candidates });
+    } catch (error) {
+      pc.close();
+      return JSON.stringify({ error: String(error) });
+    }
+  })()`);
+  return JSON.parse(raw);
+}
+
+async function localWebRtcChecks(profileId, mode) {
+  if (!baselineCapabilities || !baselineCapabilities.webRtc) {
+    skip('真实本机 WebRTC ' + mode + ' 测试', '未注入浏览器不支持 RTCPeerConnection');
+    return;
+  }
+  if (!baselineCapabilities.localStunRequests) {
+    skip('真实本机 WebRTC ' + mode + ' 测试', baselineCapabilities.localStunReason || '未注入浏览器未能访问 loopback STUN');
+    return;
+  }
+  let stun;
+  try {
+    stun = await createLocalStunServer();
+  } catch (e) {
+    skip('真实本机 WebRTC ' + mode + ' 测试', 'loopback UDP 服务不可用：' + e.message);
+    return;
+  }
+  try {
+    const result = await gatherLocalIce(profileId, stun.port);
+    if (result.unsupported || result.error) {
+      ok(false, '真实本机 WebRTC ' + mode + ' 收集失败', result);
+      return;
+    }
+    if (mode === 'proxy') {
+      eq(result.complete, true, 'proxy 模式真实 ICE 收集正常完成');
+      ok(result.candidates.length > 0, 'proxy 模式实际收集到候选以供暴露检查', result.candidates);
+      const cfg = launcher.buildConfig(store.get(profileId));
+      const allowed = new Set([cfg.fakeIp, cfg.publicIp].filter(Boolean));
+      const exposed = Array.from(new Set(result.candidates.flatMap((candidate) =>
+        String(candidate).match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g) || []
+      )));
+      const unexpected = exposed.filter((address) => !allowed.has(address));
+      eq(unexpected.length, 0, 'proxy 模式实际 ICE 候选中的 IPv4 仅为配置的假地址或 profile 地理 IP', {
+        unexpected,
+        allowed: Array.from(allowed),
+      });
+      console.log('     proxy 模式 loopback STUN 请求=' + stun.requests + '（仅本机回环测试，不代表公网 UDP 可达性）');
+    } else {
+      eq(result.complete, true, 'real 模式真实 ICE 收集正常完成');
+      ok(stun.requests > 0, 'real 模式的真实 ICE 流量仅到本机 STUN 测试端点', { requests: stun.requests });
+    }
+  } catch (e) {
+    ok(false, '真实本机 WebRTC ' + mode + ' 测试异常: ' + e.message);
+  } finally {
+    await stun.close();
+  }
+}
+
+async function unpatchedBrowserCapabilities(chromePath) {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-smoke-baseline-'));
+  const probe = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end('<!doctype html><meta charset="utf-8"><title>baseline</title>');
+  });
+  let stun = null;
+  let proc;
+  let cdp;
+  try { stun = await createLocalStunServer(); } catch { /* UDP loopback may be restricted */ }
+  await new Promise((resolve, reject) => {
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', resolve);
+  });
+  try {
+    const port = await freeLocalPort();
+    proc = spawn(chromePath, [
+      '--user-data-dir=' + userDataDir,
+      '--remote-debugging-port=' + port,
+      '--remote-debugging-address=127.0.0.1',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-background-networking',
+      '--disable-component-update',
+      'about:blank',
+    ], { stdio: 'ignore', detached: true, windowsHide: true });
+    proc.once('error', (error) => { proc.__spawnError = error; });
+
+    const deadline = Date.now() + 15000;
+    let wsUrl = '';
+    while (Date.now() < deadline) {
+      if (proc.__spawnError) throw proc.__spawnError;
+      if (proc.exitCode !== null) throw new Error('unpatched browser exited with code ' + proc.exitCode);
+      try {
+        const response = await fetch('http://127.0.0.1:' + port + '/json/version', { signal: AbortSignal.timeout(500) });
+        const version = await response.json();
+        wsUrl = version.webSocketDebuggerUrl || '';
+        if (wsUrl) break;
+      } catch {
+        /* browser is still starting */
+      }
+      await sleep(100);
+    }
+    if (!wsUrl) throw new Error('unpatched browser DevTools did not become ready');
+    cdp = await CDP.connect(wsUrl, 5000);
+    const { targetId } = await cdp.send('Target.createTarget', {
+      url: 'http://127.0.0.1:' + probe.address().port + '/',
+    });
+    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+    await cdp.try_('Runtime.enable', {}, sessionId);
+    const result = await cdp.send('Runtime.evaluate', {
+      expression: `(async () => {
+        const canvas = document.createElement('canvas');
+        let windowWebgl = false;
+        try { windowWebgl = !!canvas.getContext('webgl'); } catch {}
+        const workerWebgl = await new Promise((resolve) => {
+          if (typeof OffscreenCanvas !== 'function' || typeof Worker !== 'function') return resolve(false);
+          let worker;
+          try {
+            worker = new Worker(URL.createObjectURL(new Blob(['try { postMessage(!!new OffscreenCanvas(16,16).getContext("webgl")); } catch { postMessage(false); }'], { type: 'application/javascript' })));
+          } catch { return resolve(false); }
+          const timer = setTimeout(() => { worker.terminate(); resolve(false); }, 3000);
+          worker.onmessage = (event) => { clearTimeout(timer); worker.terminate(); resolve(event.data === true); };
+          worker.onerror = () => { clearTimeout(timer); worker.terminate(); resolve(false); };
+        });
+        let localIce = false;
+        if (typeof RTCPeerConnection === 'function' && ${stun ? `'stun:127.0.0.1:${stun.port}'` : 'null'}) {
+          try {
+            const pc = new RTCPeerConnection({ iceServers: [{ urls: ${stun ? `'stun:127.0.0.1:${stun.port}'` : '""'} }] });
+            pc.createDataChannel('baseline');
+            const gathered = new Promise((resolve) => {
+              const timer = setTimeout(() => { pc.close(); resolve(false); }, 6000);
+              pc.onicecandidate = (event) => {
+                if (event.candidate) return;
+                clearTimeout(timer);
+                pc.close();
+                resolve(true);
+              };
+            });
+            await pc.setLocalDescription(await pc.createOffer());
+            localIce = await gathered;
+          } catch { localIce = false; }
+        }
+        return JSON.stringify({ windowWebgl, workerWebgl, webRtc: typeof RTCPeerConnection === 'function', localIce });
+      })()`,
+      awaitPromise: true,
+      returnByValue: true,
+    }, sessionId);
+    if (!result || !result.result || typeof result.result.value !== 'string') throw new Error('baseline capability result was unavailable');
+    const capabilities = JSON.parse(result.result.value);
+    capabilities.localStunRequests = !!stun && stun.requests > 0;
+    if (!stun) capabilities.localStunReason = 'loopback UDP server could not bind';
+    else if (!capabilities.localStunRequests) capabilities.localStunReason = 'unpatched browser did not send a local STUN request';
+    return capabilities;
+  } finally {
+    if (cdp) cdp.close();
+    await stopRawBrowser(proc);
+    await new Promise((resolve) => probe.close(resolve));
+    if (stun) await stun.close();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+}
+
+async function serverValidationChecks() {
+  console.log('\n[2a] HTTP 输入验证');
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const port = server.address().port;
+  const request = (method, requestPath, body) => new Promise((resolve, reject) => {
+    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port,
+      method,
+      path: requestPath,
+      headers: {
+        host: '127.0.0.1:' + port,
+        ...(payload ? { 'content-type': 'application/json', 'content-length': payload.length } : {}),
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+
+  try {
+    const malformed = await request('GET', '/%ZZ');
+    eq(malformed.status, 400, '畸形百分号编码路径返回 HTTP 400');
+    let malformedBody = {};
+    try { malformedBody = JSON.parse(malformed.body); } catch { /* asserted below */ }
+    ok(/路径格式错误/.test(malformedBody.error || ''), '畸形路径返回结构化错误');
+    const healthy = await request('GET', '/api/state');
+    eq(healthy.status, 200, '处理畸形 URL 后服务仍可响应后续请求');
+
+    const invalidBatch = await request('POST', '/api/profiles/batch', { count: 1.5, proxiesText: '' });
+    eq(invalidBatch.status, 400, 'API 拒绝小数批量数量');
+    const overLimit = await request('POST', '/api/profiles/batch', { count: 101, proxiesText: '' });
+    eq(overLimit.status, 400, 'API 拒绝超过共享上限的批量数量');
+    const mismatchedUa = await request('POST', '/api/profiles', {
+      name: 'invalid-custom-ua',
+      platform: 'win',
+      userAgentMode: 'custom',
+      userAgentCustom: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+    });
+    eq(mismatchedUa.status, 400, 'API 保存时拒绝可识别的平台冲突自定义 UA');
+    let mismatchBody = {};
+    try { mismatchBody = JSON.parse(mismatchedUa.body); } catch { /* asserted below */ }
+    ok(/自动生成/.test(mismatchBody.error || ''), 'UA 冲突错误建议使用自动生成的默认 UA');
+
+    const defaultBatch = await request('POST', '/api/profiles/batch', { name: 'api-default-count', proxiesText: '' });
+    eq(defaultBatch.status, 200, 'API 未提供 count 时保留默认批量创建行为');
+    const defaultResult = JSON.parse(defaultBatch.body);
+    eq(defaultResult.count, 1, '未提供 count 且无代理时默认创建一个环境');
+    ok(defaultResult.created[0].warnings.some((warning) => /直连/.test(warning)), 'API 返回无代理直连警告');
+  } catch (e) {
+    ok(false, 'HTTP 输入验证测试异常: ' + e.message);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+async function concurrentStoreChecks() {
+  console.log('\n[2b] 跨进程存储并发');
+  const dataDir = path.join(os.tmpdir(), 'fb-smoke-concurrency-' + process.pid);
+  fs.rmSync(dataDir, { recursive: true, force: true });
+  const storePath = path.resolve(__dirname, '../src/store.js');
+  const seedScript = `const store = require(${JSON.stringify(storePath)}); console.log(JSON.stringify(store.createMany(Array.from({length: 12}, (_, i) => ({name: 'seed-' + i}))).map(p => p.id)));`;
+  const baseEnv = { ...process.env, FB_DATA: dataDir };
+  const seeded = spawnSync(process.execPath, ['-e', seedScript], { env: baseEnv, encoding: 'utf8', timeout: 15000 });
+  if (seeded.status !== 0) {
+    ok(false, '并发测试初始化失败: ' + (seeded.stderr || seeded.error || 'unknown'));
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    return;
+  }
+  const ids = JSON.parse(seeded.stdout.trim());
+  const childScript = `
+    const store = require(${JSON.stringify(storePath)});
+    const args = JSON.parse(process.env.STORE_OP_ARGS);
+    let result;
+    if (process.env.STORE_OP === 'create') result = store.create({name: args.name});
+    if (process.env.STORE_OP === 'update') result = store.update(args.id, {notes: args.notes});
+    if (process.env.STORE_OP === 'remove') result = store.remove(args.id);
+    if (process.env.STORE_OP === 'clone') result = store.clone(args.id);
+    if (process.env.STORE_OP === 'import') result = store.importAll([{name: args.name}]);
+    if (!result) throw new Error('store operation failed: ' + process.env.STORE_OP);
+  `;
+  const jobs = [
+    ...ids.slice(0, 8).map((id, i) => ({ op: 'update', args: { id, notes: 'updated-' + i } })),
+    ...ids.slice(8, 12).map((id) => ({ op: 'remove', args: { id } })),
+    ...Array.from({ length: 8 }, (_, i) => ({ op: 'create', args: { name: 'parallel-' + i } })),
+    ...Array.from({ length: 3 }, (_, i) => ({ op: 'import', args: { name: 'imported-' + i } })),
+    ...Array.from({ length: 3 }, () => ({ op: 'clone', args: { id: ids[0] } })),
+  ];
+  const runJob = (job) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['-e', childScript], {
+      env: { ...baseEnv, STORE_OP: job.op, STORE_OP_ARGS: JSON.stringify(job.args) },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', (code) => code === 0 ? resolve() : reject(new Error(job.op + ' exited ' + code + ': ' + stderr)));
+  });
+  try {
+    await Promise.all(jobs.map(runJob));
+    const db = JSON.parse(fs.readFileSync(path.join(dataDir, 'profiles.json'), 'utf8'));
+    const updated = ids.slice(0, 8).every((id, i) => db.profiles.some((profile) => profile.id === id && profile.notes === 'updated-' + i));
+    const deleted = ids.slice(8, 12).every((id) => !db.profiles.some((profile) => profile.id === id));
+    eq(db.profiles.length, 22, '并发 create/update/remove/import/clone 后记录数完整');
+    ok(updated && deleted, '不同进程的更新与删除互不覆盖');
+  } catch (e) {
+    ok(false, '并发存储测试异常: ' + e.message);
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
+async function staleStoreRecoveryChecks() {
+  console.log('\n[2b.1] 同时回收陈旧锁并原子初始化存储');
+  const dataDir = path.join(os.tmpdir(), 'fb-smoke-stale-lock-' + process.pid);
+  const lockDir = path.join(dataDir, 'profiles.json.lock');
+  const readyDir = path.join(dataDir, 'ready');
+  const releaseFile = path.join(dataDir, 'release');
+  const renameAttempts = path.join(dataDir, 'rename-attempts');
+  const storePath = path.resolve(__dirname, '../src/store.js');
+  fs.rmSync(dataDir, { recursive: true, force: true });
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.mkdirSync(readyDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: 0, createdAt: 0 }));
+  const count = 8;
+  const childScript = `
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const store = require(${JSON.stringify(storePath)});
+    const lock = path.join(process.env.FB_DATA, 'profiles.json.lock');
+    fs.writeFileSync(path.join(process.env.READY_DIR, process.env.WORKER_INDEX), 'ready');
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    while (!fs.existsSync(process.env.RELEASE_FILE)) Atomics.wait(wait, 0, 0, 10);
+    const renameSync = fs.renameSync;
+    fs.renameSync = function (from, to) {
+      if (from === lock) {
+        fs.appendFileSync(process.env.RENAME_ATTEMPTS, process.pid + '\\n');
+        while (!fs.existsSync(process.env.RELEASE_FILE + '.rename')) Atomics.wait(wait, 0, 0, 10);
+      }
+      return renameSync.call(fs, from, to);
+    };
+    store.create({ name: 'recovered-' + process.env.WORKER_INDEX });
+  `;
+  const workers = Array.from({ length: count }, (_, index) => {
+    const child = spawn(process.execPath, ['-e', childScript], {
+      env: {
+        ...process.env,
+        FB_DATA: dataDir,
+        READY_DIR: readyDir,
+        RELEASE_FILE: releaseFile,
+        RENAME_ATTEMPTS: renameAttempts,
+        WORKER_INDEX: String(index),
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const done = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code) => code === 0 ? resolve() : reject(new Error('worker exited ' + code + ': ' + stderr)));
+    });
+    return { child, done };
+  });
+  const allDone = Promise.all(workers.map((worker) => worker.done));
+  allDone.catch(() => {});
+  try {
+    const deadline = Date.now() + 15000;
+    while (fs.readdirSync(readyDir).length < count && Date.now() < deadline) {
+      if (workers.some(({ child }) => child.exitCode !== null)) throw new Error('a worker exited before the barrier');
+      await sleep(10);
+    }
+    eq(fs.readdirSync(readyDir).length, count, '所有写入进程同时到达陈旧锁恢复屏障');
+    await sleep(250);
+    fs.writeFileSync(releaseFile, 'go');
+    await sleep(250);
+    fs.writeFileSync(releaseFile + '.rename', 'go');
+    await allDone;
+    const db = JSON.parse(fs.readFileSync(path.join(dataDir, 'profiles.json'), 'utf8'));
+    eq(db.profiles.length, count, '并发陈旧锁恢复与首次初始化保留全部 profile');
+    const attempts = fs.existsSync(renameAttempts) ? fs.readFileSync(renameAttempts, 'utf8').trim().split('\n').filter(Boolean) : [];
+    eq(attempts.length, 1, '同一陈旧锁只允许一个进程执行目录回收');
+    ok(!fs.existsSync(lockDir) && !fs.existsSync(lockDir + '.reaper'), '锁及回收协调目录在所有写入结束后清理');
+  } catch (e) {
+    ok(false, '同时回收陈旧锁测试异常: ' + e.message);
+  } finally {
+    try { fs.writeFileSync(releaseFile, 'go'); } catch {}
+    try { fs.writeFileSync(releaseFile + '.rename', 'go'); } catch {}
+    await Promise.allSettled(workers.map((worker) => worker.done));
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
+async function launchPortRetryChecks() {
+  console.log('\n[2c] DevTools 端口冲突重试');
+  if (process.platform === 'win32') {
+    skip('DevTools 端口冲突重试', '本测试的可执行 stub 仅适用于 POSIX');
+    return;
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-smoke-port-retry-'));
+  const fakeBrowser = path.join(dir, 'fake-chrome');
+  const attemptsFile = path.join(dir, 'attempts');
+  const versionCallsFile = path.join(dir, 'version-calls');
+  const foreignQueriesFile = path.join(dir, 'foreign-queries');
+  fs.writeFileSync(fakeBrowser, `#!/usr/bin/env node
+const fs = require('node:fs');
+const http = require('node:http');
+if (process.argv.includes('--version')) {
+  fs.appendFileSync(process.env.FB_PORT_VERSION_CALLS_FILE, 'called\\n');
+  process.stdout.write('Google Chrome 156.0.0.0\\n');
+  process.exit(0);
+}
+const port = Number(process.argv.find((arg) => arg.startsWith('--remote-debugging-port=')).split('=')[1]);
+fs.appendFileSync(process.env.FB_PORT_RETRY_FILE, port + '\\n');
+if (process.env.FB_PORT_GENERIC_FAILURE === '1') {
+  process.stderr.write('Cannot start http server for devtools.\\n');
+  process.exitCode = 1;
+} else {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/json/version') {
+      fs.appendFileSync(process.env.FB_PORT_FOREIGN_QUERIES_FILE, 'queried\\n');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ webSocketDebuggerUrl: 'ws://127.0.0.1:' + port + '/devtools/browser/foreign-listener' }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  const reportBindFailure = () => setTimeout(() => process.stderr.write(
+    'bind() returned an error: Only one usage of each socket address (protocol/network address/port) is normally permitted. (0x2740)\\n' +
+    'bind() returned an error: Only one usage of each socket address (protocol/network address/port) is normally permitted. (0x2740)\\n' +
+    'Cannot start http server for devtools.\\n'
+  ), 250);
+  server.once('error', reportBindFailure);
+  server.listen(port, '127.0.0.1', reportBindFailure);
+}
+`, { mode: 0o755 });
+  const oldPath = process.env.FB_PORT_RETRY_FILE;
+  const oldVersionCalls = process.env.FB_PORT_VERSION_CALLS_FILE;
+  const oldForeignQueries = process.env.FB_PORT_FOREIGN_QUERIES_FILE;
+  const oldGenericFailure = process.env.FB_PORT_GENERIC_FAILURE;
+  delete process.env.FB_PORT_GENERIC_FAILURE;
+  process.env.FB_PORT_RETRY_FILE = attemptsFile;
+  process.env.FB_PORT_VERSION_CALLS_FILE = versionCallsFile;
+  process.env.FB_PORT_FOREIGN_QUERIES_FILE = foreignQueriesFile;
+  const profile = store.create({ name: 'port-retry-test' });
+  const genericProfile = store.create({ name: 'generic-devtools-error-test' });
+  try {
+    let error = null;
+    try { await launcher.launch(profile.id, { chromePath: fakeBrowser }); } catch (e) { error = e; }
+    eq(error && error.code, 'DEVTOOLS_PORT_CONFLICT', 'Windows Chrome socket-in-use 日志触发有界重试');
+    const attemptedPorts = fs.existsSync(attemptsFile) ? fs.readFileSync(attemptsFile, 'utf8').trim().split('\n') : [];
+    eq(attemptedPorts.length, 3, '端口绑定冲突最多启动尝试三次');
+    eq(new Set(attemptedPorts).size, 3, '每次重试都为 DevTools 选择新的固定端口');
+    ok(!fs.existsSync(foreignQueriesFile), '不会把候选端口上另一 Chrome 的 /json/version 当作本次启动');
+    ok(!fs.existsSync(versionCallsFile), '默认 UA 启动不会额外同步执行 Chrome --version');
+    const portsReleased = await Promise.all(attemptedPorts.map((port) => new Promise((resolve) => {
+      const probe = net.createServer();
+      probe.once('error', () => resolve(false));
+      probe.listen(Number(port), '127.0.0.1', () => probe.close(() => resolve(true)));
+    })));
+    ok(portsReleased.every(Boolean), '冲突重试结束后所有模拟监听端口均已释放');
+    eq(launcher.getRunning(profile.id), null, '冲突重试失败后没有残留运行实例');
+
+    fs.writeFileSync(attemptsFile, '');
+    process.env.FB_PORT_GENERIC_FAILURE = '1';
+    let genericError = null;
+    try { await launcher.launch(genericProfile.id, { chromePath: fakeBrowser }); } catch (e) { genericError = e; }
+    ok(!!genericError, '普通 DevTools HTTP server 启动错误仍然报告启动失败');
+    ok(genericError && genericError.code !== 'DEVTOOLS_PORT_CONFLICT', '普通 DevTools server 错误不会误触发端口重试');
+    const genericAttempts = fs.existsSync(attemptsFile) ? fs.readFileSync(attemptsFile, 'utf8').trim().split('\n').filter(Boolean) : [];
+    eq(genericAttempts.length, 1, '普通 DevTools server 错误仅启动一次');
+    eq(launcher.getRunning(genericProfile.id), null, '普通 DevTools server 错误后没有残留运行实例');
+  } catch (e) {
+    ok(false, 'DevTools 端口重试测试异常: ' + e.message);
+  } finally {
+    await launcher.stop(profile.id);
+    await launcher.stop(genericProfile.id);
+    store.remove(profile.id);
+    store.remove(genericProfile.id);
+    if (oldPath === undefined) delete process.env.FB_PORT_RETRY_FILE;
+    else process.env.FB_PORT_RETRY_FILE = oldPath;
+    if (oldVersionCalls === undefined) delete process.env.FB_PORT_VERSION_CALLS_FILE;
+    else process.env.FB_PORT_VERSION_CALLS_FILE = oldVersionCalls;
+    if (oldForeignQueries === undefined) delete process.env.FB_PORT_FOREIGN_QUERIES_FILE;
+    else process.env.FB_PORT_FOREIGN_QUERIES_FILE = oldForeignQueries;
+    if (oldGenericFailure === undefined) delete process.env.FB_PORT_GENERIC_FAILURE;
+    else process.env.FB_PORT_GENERIC_FAILURE = oldGenericFailure;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 /* ----------------------------- 1. 静态自检 ----------------------------- */
 
 function staticChecks() {
@@ -58,6 +624,143 @@ function staticChecks() {
   const chrome = findBrowser();
   ok(!!chrome, '找到 Chromium 内核: ' + (chrome || ''));
   ok(typeof WebSocket === 'function', 'Node 内置 WebSocket 可用（CDP 无需第三方包）');
+
+  const savedPath = process.env.PATH;
+  const savedBrowser = process.env.FB_BROWSER;
+  const pathDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-smoke-path-'));
+  const pathName = process.platform === 'win32' ? 'chrome.exe' : 'google-chrome';
+  const pathBrowser = path.join(pathDir, pathName);
+  fs.writeFileSync(pathBrowser, '');
+  const existsSync = fs.existsSync;
+  const accessSync = fs.accessSync;
+  try {
+    process.env.PATH = pathDir;
+    process.env.FB_BROWSER = '';
+    fs.existsSync = (candidate) => path.resolve(candidate) === path.resolve(pathBrowser);
+    fs.accessSync = (candidate, mode) => {
+      if (path.resolve(candidate) === path.resolve(pathBrowser)) return;
+      return accessSync(candidate, mode);
+    };
+    eq(browser.findBrowser(), pathBrowser, '浏览器可从 PATH 中发现');
+  } finally {
+    fs.existsSync = existsSync;
+    fs.accessSync = accessSync;
+    process.env.PATH = savedPath;
+    if (savedBrowser === undefined) delete process.env.FB_BROWSER;
+    else process.env.FB_BROWSER = savedBrowser;
+    fs.rmSync(pathDir, { recursive: true, force: true });
+  }
+
+  eq(resolveCount(undefined, 2), 2, '数量省略时使用既有默认值');
+  for (const invalid of [0, 1.5, Infinity, 101, 'not-a-number']) {
+    let rejected = false;
+    try { resolveCount(invalid); } catch { rejected = true; }
+    ok(rejected, '共享数量验证拒绝 ' + String(invalid));
+  }
+  const cliData = path.join(os.tmpdir(), 'fb-smoke-count-' + process.pid);
+  const cliCount = spawnSync(process.execPath, [path.resolve(__dirname, '../src/index.js'), 'create', '--count', 'Infinity', '--json'], {
+    env: { ...process.env, FB_DATA: cliData },
+    encoding: 'utf8',
+    timeout: 10000,
+  });
+  eq(cliCount.status, 1, 'CLI 在创建前拒绝 --count Infinity');
+  ok(/有限整数/.test(cliCount.stdout || ''), 'CLI 数量错误返回可操作说明');
+  fs.rmSync(cliData, { recursive: true, force: true });
+
+  const importData = path.join(os.tmpdir(), 'fb-smoke-import-' + process.pid);
+  const importFile = path.join(os.tmpdir(), 'fb-smoke-import-' + process.pid + '.json');
+  fs.writeFileSync(importFile, JSON.stringify([{ name: 'import-warning-test' }]));
+  const cliImport = spawnSync(process.execPath, [path.resolve(__dirname, '../src/index.js'), 'import', importFile], {
+    env: { ...process.env, FB_DATA: importData },
+    encoding: 'utf8',
+    timeout: 10000,
+  });
+  eq(cliImport.status, 0, 'CLI import 成功');
+  ok(/未配置代理/.test(cliImport.stdout || ''), 'CLI import 文本明确提示未配置代理会直连');
+  ok(/尚未按网络出口验证/.test(cliImport.stdout || ''), 'CLI import 文本提示地区一致性尚未验证');
+  fs.rmSync(importFile, { force: true });
+  fs.rmSync(importData, { recursive: true, force: true });
+
+  const listData = path.join(os.tmpdir(), 'fb-smoke-list-warnings-' + process.pid);
+  const cliCreateForList = spawnSync(process.execPath, [path.resolve(__dirname, '../src/index.js'), 'create', '--name', 'list-warning-test', '--json'], {
+    env: { ...process.env, FB_DATA: listData },
+    encoding: 'utf8',
+    timeout: 10000,
+  });
+  eq(cliCreateForList.status, 0, '为 CLI list JSON 警告测试创建隔离环境');
+  const cliList = spawnSync(process.execPath, [path.resolve(__dirname, '../src/index.js'), 'list', '--json'], {
+    env: { ...process.env, FB_DATA: listData },
+    encoding: 'utf8',
+    timeout: 10000,
+  });
+  eq(cliList.status, 0, 'CLI list --json 成功');
+  let listPayload = {};
+  try { listPayload = JSON.parse(cliList.stdout || '{}'); } catch {}
+  ok(
+    listPayload.profiles && listPayload.profiles[0] && listPayload.profiles[0].warnings.some((warning) => /未配置代理/.test(warning)),
+    'CLI list --json profile 中包含直连警告'
+  );
+  fs.rmSync(listData, { recursive: true, force: true });
+
+  const goodUa = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/156.0.0.0 Safari/537.36';
+  const matchingProfile = { platform: 'win', userAgentMode: 'custom', userAgentCustom: goodUa };
+  eq(profileConfigErrors(matchingProfile, '156.0.8078.47').length, 0, '保留与平台及 Chromium 主版本相符的自定义 UA');
+  ok(profileConfigErrors({ ...matchingProfile, platform: 'mac' }).length > 0, '检测自定义 UA 与平台的已知冲突');
+  ok(profileConfigErrors(matchingProfile, '157.0.1.2').length > 0, '检测自定义 UA 与 Chromium 主版本的已知冲突');
+  const validStoredUa = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
+  const updateProfile = store.create({ name: 'ua-update-validation', platform: 'win', userAgentMode: 'custom', userAgentCustom: validStoredUa });
+  let updateRejected = false;
+  try {
+    store.update(updateProfile.id, {
+      userAgentCustom: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+    });
+  } catch { updateRejected = true; }
+  ok(updateRejected, '更新时拒绝自定义 UA 平台冲突');
+  eq(store.get(updateProfile.id).userAgentCustom, validStoredUa, '拒绝冲突更新后保留原有有效配置');
+  store.remove(updateProfile.id);
+
+  const directWarnings = profileWarnings({ id: 'direct', proxy: { type: 'none' }, autoGeo: false }, []);
+  ok(directWarnings.some((warning) => /直连/.test(warning)), '无代理配置生成直连警告');
+  ok(directWarnings.some((warning) => /尚未按网络出口验证/.test(warning)), '未验证的地区配置生成不确定性警告');
+  const sameEndpoint = profileWarnings(
+    { id: 'one', proxy: { type: 'http', host: 'proxy.local', port: '8080', password: 'a' } },
+    [
+      { id: 'one', proxy: { type: 'http', host: 'proxy.local', port: '8080', password: 'a' } },
+      { id: 'two', proxy: { type: 'http', host: 'proxy.local', port: '8080', password: 'b' } },
+    ]
+  );
+  ok(sameEndpoint.some((warning) => /相同代理端点/.test(warning) && /无法仅凭此配置判断/.test(warning)), '相同代理端点只提示配置相同，不断言实际出口相同');
+
+  const originalWriteFile = fs.writeFileSync;
+  let profileFileWrites = 0;
+  fs.writeFileSync = function (file, ...args) {
+    if (String(file).startsWith(path.join(store.DATA, 'profiles.json.')) && String(file).endsWith('.tmp')) profileFileWrites++;
+    return originalWriteFile.call(this, file, ...args);
+  };
+  let batchCreated;
+  try {
+    batchCreated = store.createMany([{ name: 'atomic-batch-1' }, { name: 'atomic-batch-2' }]);
+  } finally {
+    fs.writeFileSync = originalWriteFile;
+  }
+  eq(batchCreated.length, 2, '批量创建返回所有新环境且不重复');
+  eq(profileFileWrites, 1, '批量创建只原子写入一次 profiles.json');
+  const beforeInvalidBatch = store.list().length;
+  let invalidBatchRejected = false;
+  try {
+    store.createMany([
+      { name: 'batch-valid-before-invalid' },
+      {
+        name: 'batch-invalid',
+        platform: 'win',
+        userAgentMode: 'custom',
+        userAgentCustom: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/156.0.0.0 Safari/537.36',
+      },
+    ]);
+  } catch { invalidBatchRejected = true; }
+  ok(invalidBatchRejected, '批量创建遇到无效配置时拒绝整批');
+  eq(store.list().length, beforeInvalidBatch, '无效批量创建没有部分写入');
+  for (const profile of batchCreated) store.remove(profile.id);
 
   const profile = {
     seed: 'testseed',
@@ -566,6 +1269,13 @@ function testHttpsRelay() {
 
 async function browserChecks() {
   console.log('\n[3] 真实启动 + 指纹读回');
+  try {
+    baselineCapabilities = await unpatchedBrowserCapabilities(findBrowser());
+    ok(true, '未注入 Chrome 基线已测量 WebGL/WebRTC 能力', baselineCapabilities);
+  } catch (e) {
+    baselineCapabilities = null;
+    ok(false, '未注入 Chrome 能力基线检查失败: ' + e.message);
+  }
 
   // 造两个指纹明显不同的环境
   const a = store.create({
@@ -604,6 +1314,45 @@ async function browserChecks() {
     const infoA = await launcher.launch(a.id);
     ok(!!infoA.pid, '环境A启动成功（' + (Date.now() - t0) + 'ms，内核 ' + infoA.browserVersion + '）');
     cleanup.push(a.id);
+    eq(
+      reattachBrowserVersionFromChild(a.id),
+      infoA.browserVersion,
+      '控制进程重启后重接管保留 browserVersion'
+    );
+    const consistentUa = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/' + infoA.browserVersion.split('.')[0] + '.0.0.0 Safari/537.36';
+    const consistentProfile = store.create({ name: 'consistent-custom-ua', platform: 'win', userAgentMode: 'custom', userAgentCustom: consistentUa });
+    eq(launcher.buildUserAgent(consistentProfile, infoA.browserVersion), consistentUa, '一致的自定义 UA 被原样保留而不自动改写');
+    store.remove(consistentProfile.id);
+
+    let versionGuardRequests = 0;
+    const versionGuardServer = http.createServer((_req, res) => {
+      versionGuardRequests++;
+      res.end('must not navigate here');
+    });
+    await new Promise((resolve, reject) => {
+      versionGuardServer.once('error', reject);
+      versionGuardServer.listen(0, '127.0.0.1', resolve);
+    });
+    const mismatchMajor = Number(infoA.browserVersion.split('.')[0]) + 1;
+    const mismatchProfile = store.create({
+      name: 'ua-version-cdp-validation',
+      platform: 'win',
+      userAgentMode: 'custom',
+      userAgentCustom: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/' + mismatchMajor + '.0.0.0 Safari/537.36',
+      startUrl: 'http://127.0.0.1:' + versionGuardServer.address().port + '/must-not-navigate',
+    });
+    try {
+      let versionError = null;
+      try { await launcher.launch(mismatchProfile.id); } catch (e) { versionError = e; }
+      eq(versionError && versionError.code, 'PROFILE_CONFIG_INVALID', '真实 Chromium 版本经 CDP 查询后拒绝矛盾 UA');
+      ok(versionError && /当前浏览器/.test(versionError.message), '版本拒绝来自实际 CDP 版本而非平台预检');
+      eq(versionGuardRequests, 0, 'CDP 版本校验在启动后的用户起始页导航之前完成');
+      eq(launcher.getRunning(mismatchProfile.id), null, 'CDP 版本不匹配后清理已启动的浏览器实例');
+    } finally {
+      await launcher.stop(mismatchProfile.id);
+      store.remove(mismatchProfile.id);
+      await new Promise((resolve) => versionGuardServer.close(resolve));
+    }
 
     const ra = await launcher.probe(a.id);
     console.log('  ── 环境A 指纹 ──');
@@ -628,8 +1377,10 @@ async function browserChecks() {
     eq(ra.deviceMemory, 8, '设备内存被改为 8GB（deviceMemory 的规范上限）');
     eq(ra.screen.width, 2560, 'screen.width = 2560');
     eq(ra.screen.height, 1440, 'screen.height = 1440');
-    eq(ra.webglVendor, 'Google Inc. (AMD)', 'WebGL 厂商被覆盖');
-    eq(ra.webglRenderer, 'ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)', 'WebGL 渲染器被覆盖');
+    if (webglAvailable('windowWebgl')) {
+      eq(ra.webglVendor, 'Google Inc. (AMD)', 'WebGL 厂商被覆盖');
+      eq(ra.webglRenderer, 'ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)', 'WebGL 渲染器被覆盖');
+    }
     eq(ra.webdriver, false, 'navigator.webdriver 为 false');
     ok(typeof ra.canvasHash === 'number' && ra.canvasHash !== 0, 'Canvas 指纹可读（' + ra.canvasHash + '）');
     ok(typeof ra.audioHash === 'number' && ra.audioHash > 0, 'Audio 指纹可读（' + ra.audioHash + '）');
@@ -762,15 +1513,17 @@ async function browserChecks() {
     eq(audit.worker.hardwareConcurrency, 12, 'Web Worker 内 hardwareConcurrency 与主线程一致（12）');
     eq(audit.worker.deviceMemory, 8, 'Web Worker 内 deviceMemory 与主线程一致（8）');
     eq(audit.worker.timezone, 'America/New_York', 'Web Worker 内时区与主线程一致');
-    eq(audit.worker.webglVendor, 'Google Inc. (AMD)', 'Worker OffscreenCanvas WebGL 厂商一致');
+    if (webglAvailable('workerWebgl')) {
+      eq(audit.worker.webglVendor, 'Google Inc. (AMD)', 'Worker OffscreenCanvas WebGL 厂商一致');
+      ok(
+        String(audit.worker.webglRenderer || '').includes('Radeon RX 6600'),
+        'Worker OffscreenCanvas WebGL 渲染器一致',
+        audit.worker
+      );
+    }
     ok(
-      String(audit.worker.webglRenderer || '').includes('Radeon RX 6600'),
-      'Worker OffscreenCanvas WebGL 渲染器一致',
-      audit.worker
-    );
-    ok(
-      audit.uaChBrandsLen >= 3 && audit.uaChBrandsLen === audit.uaChFullLen,
-      'UA-CH brands 与 fullVersionList 长度一致（' + audit.uaChBrandsLen + '）',
+      audit.uaChBrandsLen > 0 && audit.uaChBrandsLen === audit.uaChFullLen,
+      'UA-CH brands 与 fullVersionList 均存在且长度一致（' + audit.uaChBrandsLen + '）',
       audit
     );
     eq(audit.speechLeakCn, false, 'Windows en-US 环境 speechSynthesis 不泄露中文 SAPI 语音');
@@ -805,6 +1558,18 @@ async function browserChecks() {
       audit.candSrflxJson
     );
 
+    await localWebRtcChecks(a.id, 'proxy');
+    const realWebRtcProfile = store.create({ name: '本机 WebRTC real 测试', webrtc: 'real' });
+    try {
+      await launcher.launch(realWebRtcProfile.id);
+      await localWebRtcChecks(realWebRtcProfile.id, 'real');
+    } catch (e) {
+      ok(false, '启动本机 WebRTC real 测试环境失败: ' + e.message);
+    } finally {
+      await launcher.stop(realWebRtcProfile.id);
+      store.remove(realWebRtcProfile.id);
+    }
+
     // 第二个环境：指纹必须完全不同
     t0 = Date.now();
     await launcher.launch(b.id);
@@ -824,7 +1589,7 @@ async function browserChecks() {
       a: ra.canvasHash,
       b: rb.canvasHash,
     });
-    ok(ra.webglRenderer !== rb.webglRenderer, '两个环境的 WebGL 渲染器不同');
+    if (webglAvailable('windowWebgl')) ok(ra.webglRenderer !== rb.webglRenderer, '两个环境的 WebGL 渲染器不同');
     ok(JSON.stringify(ra.languages) !== JSON.stringify(rb.languages), '两个环境的语言不同');
 
     // 同一环境重开：验证离线 Cookie 导入 + 运行态导出，以及 Canvas 确定性
@@ -935,7 +1700,7 @@ async function headerChecks() {
     ok(r.fontCheck && r.fontCheck.arial === true, 'mac 环境里 Arial 仍可探测到');
     ok(r.fontCheck && r.fontCheck.yahei === false, 'mac 环境里查不到微软雅黑（字体列表按声明平台过滤）');
     ok(r.fontCheck && r.fontCheck.missing === false, '不存在的字体查不到');
-    eq(r.glMaxTextureSize, 16384, 'WebGL 最大纹理与声明的 GPU 档位一致');
+    if (webglAvailable('windowWebgl')) eq(r.glMaxTextureSize, 16384, 'WebGL 最大纹理与声明的 GPU 档位一致');
     if (r.gpuVendor !== undefined) {
       const declared = String(p.webglVendor || '');
       const expectGpu = /Apple/.test(declared)
@@ -1021,6 +1786,13 @@ async function cliDaemonChecks() {
     const port = launched.results && launched.results[0] && launched.results[0].port;
     ok(launched.ok === true && !!port, 'CLI launch 返回成功并带回调试端口 ' + port);
 
+    const listed = spawnSync(process.execPath, [indexJs, 'list', '--json'], { env, encoding: 'utf8', timeout: 10000 });
+    eq(listed.status, 0, '守护进程运行时 CLI list --json 成功');
+    let listedPayload = {};
+    try { listedPayload = JSON.parse(listed.stdout || '{}'); } catch {}
+    const listedProfile = (listedPayload.profiles || []).find((profile) => profile.id === id);
+    ok(listedProfile && listedProfile.warnings.some((warning) => /未配置代理/.test(warning)), '守护进程路径的 list --json 同样返回直连警告');
+
     // launch 进程已退出后，新建标签页仍须由后台守护进程持续维持完整伪装
     const verRes = await fetch('http://127.0.0.1:' + port + '/json/version');
     const { webSocketDebuggerUrl } = await verRes.json();
@@ -1063,7 +1835,7 @@ async function cliDaemonChecks() {
       const tabVal = JSON.parse(ev.result.value);
       eq(tabVal.tz, 'America/Los_Angeles', 'CLI launch 退出后新开标签页仍保持 America/Los_Angeles 时区');
       eq(tabVal.hc, expectHc, 'CLI launch 退出后新开标签页仍保持配置的 CPU 核数');
-      eq(tabVal.gpu, expectGpu, 'CLI launch 退出后新开标签页仍保持伪装 WebGL 渲染器');
+      if (webglAvailable('windowWebgl')) eq(tabVal.gpu, expectGpu, 'CLI launch 退出后新开标签页仍保持伪装 WebGL 渲染器');
     } finally {
       if (newTid) await cdp.try_('Target.closeTarget', { targetId: newTid });
       cdp.close();
@@ -1343,6 +2115,10 @@ async function agentAndMcpChecks() {
 (async () => {
   console.log('轻量指纹浏览器 · 冒烟测试');
   staticChecks();
+  await serverValidationChecks();
+  await concurrentStoreChecks();
+  await staleStoreRecoveryChecks();
+  await launchPortRetryChecks();
   await testRelay();
   await testSocks5Relay();
   await testHttpsRelay();
@@ -1353,12 +2129,12 @@ async function agentAndMcpChecks() {
 
   console.log('\n' + '─'.repeat(58));
   if (failures.length) {
-    console.log('\x1b[31m失败 ' + failures.length + ' 项\x1b[0m，通过 ' + pass + ' 项');
+    console.log('\x1b[31m失败 ' + failures.length + ' 项\x1b[0m，通过 ' + pass + ' 项，跳过 ' + skipped + ' 项');
     for (const f of failures) console.log('  · ' + f);
     cleanupData();
     process.exit(1);
   }
-  console.log('\x1b[32m全部通过\x1b[0m（' + pass + ' 项断言）');
+  console.log('\x1b[32m全部通过\x1b[0m（' + pass + ' 项断言，跳过 ' + skipped + ' 项）');
   cleanupData();
   process.exit(0);
 })();

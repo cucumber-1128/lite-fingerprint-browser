@@ -23,8 +23,9 @@ const store = require('./store');
 const launcher = require('./launch');
 const { findBrowser } = require('./browser');
 const { testProxy } = require('./proxy');
-const { PRESETS, getPreset, parseProxyLine, parseProxies, readJsonArg } = require('./cliutil');
+const { PRESETS, getPreset, parseProxyLine, parseProxies, readJsonArg, resolveCount } = require('./cliutil');
 const { startMcpServer } = require('./mcp');
+const { profileWarnings } = require('./profile-validation');
 
 const argv = process.argv.slice(2);
 const jsonMode = hasFlag('json');
@@ -237,9 +238,10 @@ async function cmdList() {
     });
   } else {
     await launcher.reattach();
-    rows = store.list().map((p) => {
+    const profiles = store.list();
+    rows = profiles.map((p) => {
       const info = launcher.getRunning(p.id);
-      return { ...store.publicProfile(p), running: !!info, pid: info ? info.pid : null };
+      return { ...store.publicProfile(p), running: !!info, pid: info ? info.pid : null, warnings: profileWarnings(p, profiles) };
     });
   }
   const bin = globalThis.__FB_ASSETS__ ? path.basename(process.execPath) : 'node src/index.js';
@@ -254,6 +256,7 @@ async function cmdList() {
         String(p.group || '-').padEnd(13) +
         p.name
     );
+    for (const warning of p.warnings || []) lines.push('  ⚠ ' + warning);
   }
   emit({ ok: true, count: rows.length }, lines.join('\n'));
 }
@@ -271,8 +274,13 @@ async function cmdCreate() {
     proxies = [parseProxyLine(argValue('proxy'))];
   }
 
-  const countGiven = argValue('count') !== null;
-  let count = countGiven ? Math.max(1, Number(argValue('count')) || 1) : proxies.length || 1;
+  const countGiven = argv.includes('--count') || argv.some((arg) => String(arg).startsWith('--count='));
+  let count;
+  try {
+    count = resolveCount(countGiven ? argValue('count') : undefined, proxies.length || 1);
+  } catch (e) {
+    return fail(e.message);
+  }
   if (proxies.length && count > proxies.length) {
     return fail('代理只有 ' + proxies.length + ' 个，但 --count=' + count + '；一对一是硬要求');
   }
@@ -280,7 +288,7 @@ async function cmdCreate() {
   const baseName = argValue('name') || spec.name || (preset ? preset.label : '新环境');
   const group = argValue('group') || spec.group || (preset ? preset.label : '');
 
-  const created = [];
+  const fieldsList = [];
   for (let i = 0; i < count; i++) {
     const fields = { ...spec };
     delete fields.preset;
@@ -294,11 +302,20 @@ async function cmdCreate() {
     fields.group = fields.group || group;
     if (proxies[i]) fields.proxy = proxies[i];
     if (hasFlag('auto-geo')) fields.autoGeo = true;
-    created.push(store.publicProfile(store.create(fields)));
+    fieldsList.push(fields);
   }
+  const createdProfiles = store.createMany(fieldsList);
+  const allProfiles = store.list();
+  const created = createdProfiles.map((profile) => ({
+    ...store.publicProfile(profile),
+    warnings: profileWarnings(profile, allProfiles),
+  }));
 
   const text = created
-    .map((p) => '✓ ' + p.name + '  ' + p.id + '  ' + p.platform + ' / ' + p.timezone + (p.proxy.host ? ' / ' + p.proxy.type + ' ' + p.proxy.host : ''))
+    .flatMap((profile) => [
+      '✓ ' + profile.name + '  ' + profile.id + '  ' + profile.platform + ' / ' + profile.timezone + (profile.proxy.host ? ' / ' + profile.proxy.type + ' ' + profile.proxy.host : ''),
+      ...(profile.warnings || []).map((warning) => '  ⚠ ' + warning),
+    ])
     .join('\n');
   return emit({ ok: true, count: created.length, created }, text);
 }
@@ -309,7 +326,14 @@ async function cmdClone(id) {
   if (!p) return fail('环境不存在：' + id);
   const name = argValue('name');
   const saved = name ? store.update(p.id, { name }) : p;
-  return emit({ ok: true, profile: store.publicProfile(saved) }, '✓ 已克隆为「' + saved.name + '」（' + saved.id + '）');
+  const publicProfile = {
+    ...store.publicProfile(saved),
+    warnings: profileWarnings(saved, store.list()),
+  };
+  return emit(
+    { ok: true, profile: publicProfile },
+    ['✓ 已克隆为「' + saved.name + '」（' + saved.id + '）', ...(publicProfile.warnings || []).map((warning) => '  ⚠ ' + warning)].join('\n')
+  );
 }
 
 async function cmdRm(ids) {
@@ -475,9 +499,22 @@ async function cmdImport(file) {
   const items = Array.isArray(raw) ? raw : raw.profiles;
   if (!Array.isArray(items)) return fail('文件里没有 profiles 数组');
   const created = store.importAll(items);
+  const allProfiles = store.list();
+  const profiles = created.map((profile) => ({
+    ...store.publicProfile(profile),
+    warnings: profileWarnings(profile, allProfiles),
+  }));
+  const lines = ['✓ 已导入 ' + created.length + ' 个环境（代理密码需重新填写）'];
+  for (const profile of profiles) {
+    for (const warning of profile.warnings) lines.push('  ⚠ ' + warning);
+  }
   return emit(
-    { ok: true, imported: created.length, profiles: created.map(store.publicProfile) },
-    '✓ 已导入 ' + created.length + ' 个环境（代理密码需重新填写）'
+    {
+      ok: true,
+      imported: created.length,
+      profiles,
+    },
+    lines.join('\n')
   );
 }
 

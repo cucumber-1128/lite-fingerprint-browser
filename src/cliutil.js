@@ -5,6 +5,17 @@
  */
 const fs = require('node:fs');
 
+const MAX_BATCH_COUNT = 100;
+
+function resolveCount(value, fallback = 1) {
+  const raw = value === undefined ? fallback : value;
+  const count = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  if (!Number.isFinite(count) || !Number.isInteger(count) || count < 1 || count > MAX_BATCH_COUNT) {
+    throw new Error('数量必须是 1 到 ' + MAX_BATCH_COUNT + ' 之间的有限整数');
+  }
+  return count;
+}
+
 /** 地区预设：只锁"和地区绑定的字段"，屏幕/CPU/GPU 仍然随机，保证每个环境指纹不同 */
 const PRESETS = {
   'us-shop': {
@@ -293,6 +304,8 @@ function parseCookiesInput(input) {
 }
 
 module.exports = {
+  MAX_BATCH_COUNT,
+  resolveCount,
   PRESETS,
   getPreset,
   parseProxyLine,

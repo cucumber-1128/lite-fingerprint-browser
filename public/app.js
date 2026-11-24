@@ -92,12 +92,12 @@ function render() {
   $('#empty').hidden = list.length > 0;
   $('#empty').innerHTML = all.length
     ? '<p>没有匹配的环境。</p><p>清空搜索框或切回「全部分组」。</p>'
-    : '<p>还没有环境。</p><p>点右上角「新建环境」，每个环境有独立的 Cookie 存储、独立的指纹、独立的代理。</p>';
+    : '<p>还没有环境。</p><p>点右上角「新建环境」，每个环境有独立的 Cookie 存储和指纹配置；代理按环境配置，未配置时使用本机网络直连。</p>';
 
   $('#hint').innerHTML =
     '浏览器内核：<b>' +
     (state.browserPath ? esc(state.browserPath) : '未找到，请安装 Chrome 或用 FB_BROWSER 指定') +
-    '</b> · 每个环境使用独立 <b>user-data-dir</b>，Cookie / 缓存 / 登录态互不相通；' +
+    '</b> · 每个环境使用独立 <b>user-data-dir</b>，Cookie / 缓存 / 登录态互不相通；代理按环境配置，未配置时直连；' +
     '指纹在 Chromium 原生层（UA、UA-CH、时区、locale）与主世界脚本（Canvas、WebGL、Audio、字体、屏幕）两层同时伪装。' +
     (filtered ? ' · 当前筛选出 <b>' + list.length + '</b> / ' + all.length + ' 个环境。' : '');
 
@@ -129,6 +129,7 @@ function render() {
           <span>时区 <code>${esc(p.timezone)}</code> · 语言 <code>${esc((p.languages || []).join(','))}</code></span>
           <span>WebGL <code>${esc((p.webglRenderer || '').slice(0, 46))}</code></span>
           <span>代理 <code>${esc(proxyText)}</code> · WebRTC ${esc(p.webrtc)}</span>
+          ${(p.warnings || []).map((warning) => `<span class="warning">⚠ ${esc(warning)}</span>`).join('')}
           ${p.notes ? `<span class="note">备注 <code>${esc(p.notes)}</code></span>` : ''}
         </div>
         <div class="card-actions">
@@ -855,16 +856,17 @@ $('#btnSubmitBatch').addEventListener('click', async () => {
   $('#batchErr').textContent = '';
   btn.disabled = true;
   try {
+    const body = {
+      preset: $('#batchPreset').value,
+      name: $('#batchName').value.trim(),
+      group: $('#batchGroup').value.trim(),
+      proxiesText: $('#batchProxies').value,
+      autoGeo: $('#batchAutoGeo').checked,
+    };
+    if ($('#batchCountInput').value) body.count = Number($('#batchCountInput').value);
     const r = await api('/api/profiles/batch', {
       method: 'POST',
-      body: {
-        preset: $('#batchPreset').value,
-        name: $('#batchName').value.trim(),
-        group: $('#batchGroup').value.trim(),
-        count: $('#batchCountInput').value ? Number($('#batchCountInput').value) : 0,
-        proxiesText: $('#batchProxies').value,
-        autoGeo: $('#batchAutoGeo').checked,
-      },
+      body,
     });
     $('#batchDlg').close();
     await load(true);

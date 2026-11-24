@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { assertProfileConfig } = require('./profile-validation');
 
 // 打包成 exe 后，数据目录跟着 exe 走（绿色版）；不可写时退到 %LOCALAPPDATA%
 const ROOT = process.env.FB_APP_ROOT ? path.resolve(process.env.FB_APP_ROOT) : path.resolve(__dirname, '..');
@@ -26,6 +27,7 @@ function pickDataDir(root) {
 const DATA = pickDataDir(ROOT);
 const FILE = path.join(DATA, 'profiles.json');
 const PROFILE_ROOT = path.join(DATA, 'profiles');
+const LOCK = FILE + '.lock';
 
 /* ------------------------------ 指纹素材池 ------------------------------ */
 
@@ -102,13 +104,20 @@ function uid() {
 
 function ensure() {
   fs.mkdirSync(PROFILE_ROOT, { recursive: true });
-  if (!fs.existsSync(FILE)) {
-    fs.writeFileSync(FILE, JSON.stringify({ version: 1, profiles: [] }, null, 2), 'utf8');
+}
+
+function initializeFile() {
+  if (fs.existsSync(FILE)) return;
+  try {
+    fs.writeFileSync(FILE, JSON.stringify({ version: 1, profiles: [] }, null, 2), { encoding: 'utf8', flag: 'wx' });
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
   }
 }
 
-function load() {
+function loadUnlocked() {
   ensure();
+  initializeFile();
   let raw;
   try {
     raw = fs.readFileSync(FILE, 'utf8');
@@ -132,11 +141,113 @@ function load() {
   }
 }
 
+function load() {
+  return withLock(loadUnlocked);
+}
+
 function save(db) {
   ensure();
-  const tmp = FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2), 'utf8');
-  fs.renameSync(tmp, FILE);
+  const tmp = FILE + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(db, null, 2), { encoding: 'utf8', flag: 'wx' });
+    fs.renameSync(tmp, FILE);
+  } finally {
+    try {
+      fs.unlinkSync(tmp);
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+  }
+}
+
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+function lockOwner() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(LOCK, 'owner.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function acquireLock() {
+  const deadline = Date.now() + 30000;
+  while (true) {
+    let created = false;
+    try {
+      fs.mkdirSync(LOCK);
+      created = true;
+    } catch (e) {
+      if (e.code !== 'EEXIST' && e.code !== 'EISDIR') throw e;
+    }
+    if (created) {
+      try {
+        fs.writeFileSync(path.join(LOCK, 'owner.json'), JSON.stringify({ pid: process.pid, createdAt: Date.now() }), 'utf8');
+        return;
+      } catch (e) {
+        fs.rmSync(LOCK, { recursive: true, force: true });
+        throw e;
+      }
+    }
+
+    const owner = lockOwner();
+    let stale = !!owner && !processAlive(owner.pid);
+    if (stale) {
+      let ownsReaper = false;
+      try {
+        fs.mkdirSync(LOCK + '.reaper');
+        ownsReaper = true;
+      } catch (e) {
+        if (e.code !== 'EEXIST' && e.code !== 'EISDIR') throw e;
+      }
+      if (ownsReaper) {
+        let reclaimed = false;
+        try {
+          const currentOwner = lockOwner();
+          const stillStale = !!currentOwner && !processAlive(currentOwner.pid);
+          if (stillStale) {
+            const abandoned = LOCK + '.stale-' + process.pid + '-' + crypto.randomBytes(4).toString('hex');
+            try {
+              fs.renameSync(LOCK, abandoned);
+              fs.rmSync(abandoned, { recursive: true, force: true });
+              reclaimed = true;
+            } catch (e) {
+              if (e.code !== 'ENOENT' && e.code !== 'EEXIST') throw e;
+            }
+          }
+        } finally {
+          fs.rmSync(LOCK + '.reaper', { recursive: true, force: true });
+        }
+        if (reclaimed) continue;
+      }
+    }
+    if (Date.now() >= deadline) {
+      const error = new Error(
+        'Timed out waiting for profile store lock at ' + LOCK + '; verify no writer is active before removing this lock or its .reaper sibling'
+      );
+      error.code = 'STORE_LOCK_TIMEOUT';
+      throw error;
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
+
+function withLock(callback) {
+  ensure();
+  acquireLock();
+  try {
+    return callback();
+  } finally {
+    fs.rmSync(LOCK, { recursive: true, force: true });
+  }
 }
 
 /** 屏幕参数归一化：修正大于屏高或任务栏扣除异常的 availHeight */
@@ -243,8 +354,7 @@ function get(id) {
   return load().profiles.find((p) => p.id === id) || null;
 }
 
-function create(input = {}) {
-  const db = load();
+function createProfile(db, input = {}) {
   const p = defaults(input);
   // 允许覆盖任意字段
   for (const [k, v] of Object.entries(input)) {
@@ -261,48 +371,73 @@ function create(input = {}) {
     }
   }
   p.screen = normalizeScreen(p.screen, p.platform);
+  assertProfileConfig(p);
   p.updatedAt = new Date().toISOString();
   db.profiles.push(p);
-  save(db);
-  fs.mkdirSync(profileDir(p.id), { recursive: true });
   return p;
+}
+
+function create(input = {}) {
+  return withLock(() => {
+    const db = loadUnlocked();
+    const profile = createProfile(db, input);
+    save(db);
+    fs.mkdirSync(profileDir(profile.id), { recursive: true });
+    return profile;
+  });
+}
+
+function createMany(inputs) {
+  return withLock(() => {
+    const db = loadUnlocked();
+    const created = (Array.isArray(inputs) ? inputs : []).map((input) => createProfile(db, input));
+    if (!created.length) return created;
+    save(db);
+    for (const profile of created) fs.mkdirSync(profileDir(profile.id), { recursive: true });
+    return created;
+  });
 }
 
 function update(id, patch = {}) {
-  const db = load();
-  const p = db.profiles.find((x) => x.id === id);
-  if (!p) return null;
-  for (const [k, v] of Object.entries(patch)) {
-    if (k === 'id' || k === 'createdAt' || v === undefined) continue;
-    if (k === 'proxy' && v && typeof v === 'object') {
-      const { hasPassword, ...rest } = v; // 只读派生字段，不落库
-      p.proxy = { ...p.proxy, ...rest };
-    } else if (k === 'screen' && v && typeof v === 'object') {
-      p.screen = { ...p.screen, ...v };
-    } else if (k === 'deviceMemory') {
-      p.deviceMemory = clampMemory(v);
-    } else {
-      p[k] = v;
+  return withLock(() => {
+    const db = loadUnlocked();
+    const p = db.profiles.find((x) => x.id === id);
+    if (!p) return null;
+    for (const [k, v] of Object.entries(patch)) {
+      if (k === 'id' || k === 'createdAt' || v === undefined) continue;
+      if (k === 'proxy' && v && typeof v === 'object') {
+        const { hasPassword, ...rest } = v; // 只读派生字段，不落库
+        p.proxy = { ...p.proxy, ...rest };
+      } else if (k === 'screen' && v && typeof v === 'object') {
+        p.screen = { ...p.screen, ...v };
+      } else if (k === 'deviceMemory') {
+        p.deviceMemory = clampMemory(v);
+      } else {
+        p[k] = v;
+      }
     }
-  }
-  p.screen = normalizeScreen(p.screen, p.platform);
-  p.updatedAt = new Date().toISOString();
-  save(db);
-  return p;
+    p.screen = normalizeScreen(p.screen, p.platform);
+    assertProfileConfig(p);
+    p.updatedAt = new Date().toISOString();
+    save(db);
+    return p;
+  });
 }
 
 function remove(id) {
-  const db = load();
-  const i = db.profiles.findIndex((x) => x.id === id);
-  if (i < 0) return false;
-  db.profiles.splice(i, 1);
-  save(db);
-  try {
-    fs.rmSync(profileDir(id), { recursive: true, force: true });
-  } catch {
-    /* 文件被浏览器占用时忽略 */
-  }
-  return true;
+  return withLock(() => {
+    const db = loadUnlocked();
+    const i = db.profiles.findIndex((x) => x.id === id);
+    if (i < 0) return false;
+    db.profiles.splice(i, 1);
+    save(db);
+    try {
+      fs.rmSync(profileDir(id), { recursive: true, force: true });
+    } catch {
+      /* 文件被浏览器占用时忽略 */
+    }
+    return true;
+  });
 }
 
 function profileDir(id) {
@@ -318,10 +453,20 @@ function profileDir(id) {
  * Cookie 不会复制：user-data-dir 是新的。
  */
 function clone(id) {
-  const src = get(id);
-  if (!src) return null;
-  const { id: _id, createdAt: _c, updatedAt: _u, ...rest } = src;
-  return create({ ...rest, name: (src.name || '环境') + '（副本）', seed: crypto.randomBytes(8).toString('hex') });
+  return withLock(() => {
+    const db = loadUnlocked();
+    const src = db.profiles.find((profile) => profile.id === id);
+    if (!src) return null;
+    const { id: _id, createdAt: _c, updatedAt: _u, ...rest } = src;
+    const profile = createProfile(db, {
+      ...rest,
+      name: (src.name || '环境') + '（副本）',
+      seed: crypto.randomBytes(8).toString('hex'),
+    });
+    save(db);
+    fs.mkdirSync(profileDir(profile.id), { recursive: true });
+    return profile;
+  });
 }
 
 /** 导出可迁移的配置：不含密码（密码只写不读），也不带 id/时间戳 */
@@ -339,16 +484,16 @@ function exportAll() {
 
 /** 导入：全部当新环境处理（重新分配 id），密码留空等用户补 */
 function importAll(items) {
-  const out = [];
+  const inputs = [];
   for (const item of Array.isArray(items) ? items : []) {
     if (!item || typeof item !== 'object') continue;
     const { id: _id, createdAt: _c, updatedAt: _u, ...rest } = item;
     if (rest.proxy && typeof rest.proxy === 'object') {
       rest.proxy = { ...rest.proxy, password: '' };
     }
-    out.push(create(rest));
+    inputs.push(rest);
   }
-  return out;
+  return createMany(inputs);
 }
 
 /** 对外暴露：代理密码只写不读，换成 hasPassword */
@@ -367,6 +512,7 @@ module.exports = {
   list,
   get,
   create,
+  createMany,
   update,
   remove,
   clone,

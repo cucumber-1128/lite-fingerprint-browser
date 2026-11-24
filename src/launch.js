@@ -14,6 +14,7 @@ const { createRelay, testProxy } = require('./proxy');
 const { countryToLocale, TIMEZONE_COORDS, parseCookiesInput } = require('./cliutil');
 const runtime = require('./runtime');
 const store = require('./store');
+const { assertProfileConfig } = require('./profile-validation');
 
 const PATCH_FILE = path.join(__dirname, 'fp', 'patch.js');
 
@@ -454,47 +455,128 @@ function freePort() {
   });
 }
 
-/** 固定端口时 Chrome 不写 DevToolsActivePort，用 /json/version 拿浏览器级 websocket */
-async function browserWs(port) {
-  const res = await fetch('http://127.0.0.1:' + port + '/json/version', {
-    signal: AbortSignal.timeout(800),
-  });
-  if (!res.ok) return '';
-  const info = await res.json();
-  return info.webSocketDebuggerUrl || '';
+function validDevToolsEndpoint(value, expectedPort) {
+  try {
+    const endpoint = new URL(value);
+    if (
+      endpoint.protocol === 'ws:' &&
+      ['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname) &&
+      Number(endpoint.port) === expectedPort &&
+      /^\/devtools\/browser\/[^/]+$/.test(endpoint.pathname)
+    ) {
+      return endpoint.href;
+    }
+  } catch {
+    /* ignore malformed endpoint */
+  }
+  return '';
 }
 
-async function waitForDevTools(userDataDir, proc, timeoutMs = 25000, knownPort = 0) {
-  const file = path.join(userDataDir, 'DevToolsActivePort');
+function devToolsEndpoint(logPath, startOffset, expectedPort) {
+  let fd;
+  try {
+    fd = fs.openSync(logPath, 'r');
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(startOffset, size - 131072);
+    const buf = Buffer.alloc(Math.max(0, size - start));
+    if (!buf.length) return '';
+    fs.readSync(fd, buf, 0, buf.length, start);
+    const output = buf.toString('utf8');
+    const matches = output.matchAll(/DevTools listening on (ws:\/\/[^\s]+)/g);
+    for (const match of matches) {
+      const endpoint = validDevToolsEndpoint(match[1], expectedPort);
+      if (endpoint) return endpoint;
+    }
+    return '';
+  } catch {
+    return '';
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function devToolsPortConflict(logPath, startOffset) {
+  let fd;
+  try {
+    fd = fs.openSync(logPath, 'r');
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(startOffset, size - 65536);
+    const buf = Buffer.alloc(Math.max(0, size - start));
+    if (buf.length) fs.readSync(fd, buf, 0, buf.length, start);
+    const logText = buf.toString('utf8');
+    return /address already in use|eaddrinuse|failed to bind.*(?:debug|port)|cannot bind.*(?:debug|port)/i.test(logText) ||
+      /bind\(\) returned an error:\s*only one usage of each socket address\b/i.test(logText);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+async function waitForDevTools(proc, timeoutMs = 25000, knownPort = 0, logPath = '', logOffset = 0) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
+    if (logPath && devToolsPortConflict(logPath, logOffset)) {
+      const error = new Error('DevTools port is already in use');
+      error.code = 'DEVTOOLS_PORT_CONFLICT';
+      throw error;
+    }
     if (proc.exitCode !== null) throw new Error('浏览器启动后立即退出（exit ' + proc.exitCode + '）');
     if (knownPort) {
-      try {
-        const wsUrl = await browserWs(knownPort);
-        if (wsUrl) {
-          await sleep(120);
-          return { port: knownPort, wsUrl };
-        }
-      } catch {
-        /* 还没起来 */
-      }
-    }
-    try {
-      const txt = fs.readFileSync(file, 'utf8');
-      const lines = txt.split('\n').map((s) => s.trim());
-      const port = parseInt(lines[0], 10);
-      const wsPath = lines[1] || '';
-      if (port > 0 && wsPath) {
+      const wsUrl = logPath && devToolsEndpoint(logPath, logOffset, knownPort);
+      if (wsUrl) {
         await sleep(120);
-        return { port, wsUrl: 'ws://127.0.0.1:' + port + wsPath };
+        return { port: knownPort, wsUrl };
       }
-    } catch {
-      /* 还没生成，继续等 */
     }
     await sleep(120);
   }
   throw new Error('等待 DevTools 端口超时，Chrome 可能启动失败（看 data/logs 里的日志）');
+}
+
+async function killAndWait(proc, timeoutMs = 1000) {
+  if (!proc || !proc.pid) return;
+  const exited = new Promise((resolve) => {
+    if (proc.exitCode !== null || proc.signalCode) return resolve();
+    proc.once('exit', resolve);
+  });
+  await killTree(proc.pid);
+  await Promise.race([exited, sleep(timeoutMs)]);
+}
+
+async function spawnBrowserWithPortRetry(chromePath, args, logPath, logFd, initialPort) {
+  let port = initialPort;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) port = await freePort();
+    const logOffset = fs.fstatSync(logFd).size;
+    const attemptArgs = args.map((arg) =>
+      String(arg).startsWith('--remote-debugging-port=') ? '--remote-debugging-port=' + port : arg
+    );
+    const proc = spawn(chromePath, attemptArgs, {
+      stdio: ['ignore', 'ignore', logFd],
+      detached: true,
+      windowsHide: false,
+    });
+    proc.on('error', (e) => {
+      try {
+        fs.appendFileSync(logPath, '\n[spawn error] ' + e.message + '\n');
+      } catch {
+        /* ignore */
+      }
+    });
+
+    try {
+      const devtools = await waitForDevTools(proc, 25000, port, logPath, logOffset);
+      return { proc, port, devtools };
+    } catch (e) {
+      if (e.code !== 'DEVTOOLS_PORT_CONFLICT' || attempt === 2) {
+        await killAndWait(proc);
+        throw e;
+      }
+      await killAndWait(proc);
+    }
+  }
+  throw new Error('DevTools port allocation retries exhausted');
 }
 
 /* --------------------------------- 会话接管 -------------------------------- */
@@ -583,6 +665,7 @@ function remember(inst) {
   db[inst.profileId] = {
     pid: inst.proc ? inst.proc.pid : null,
     port: inst.port,
+    wsUrl: inst.wsUrl || null,
     startedAt: inst.startedAt,
     chromePath: inst.chromePath,
     relayPort: inst.relay ? inst.relay.port : inst.relayPortHint || null,
@@ -684,26 +767,28 @@ async function reattach() {
       continue;
     }
 
-    // 临时端口（0）会写 DevToolsActivePort；固定端口不写，退回注册表里记下的端口
-    let wsUrl = '';
-    let port = 0;
-    try {
-      const lines = fs
-        .readFileSync(path.join(store.profileDir(id), 'DevToolsActivePort'), 'utf8')
-        .split('\n')
-        .map((s) => s.trim());
-      port = parseInt(lines[0], 10) || 0;
-      if (port > 0 && lines[1]) wsUrl = 'ws://127.0.0.1:' + port + lines[1];
-    } catch {
-      /* 固定端口不会生成这个文件 */
-    }
-    if (!wsUrl && meta.port) {
+    // 优先使用本次启动时从浏览器进程日志确认的 endpoint。
+    const expectedPort = Number(meta.port) || 0;
+    let wsUrl = validDevToolsEndpoint(meta.wsUrl, expectedPort);
+    let port = expectedPort;
+    if (!wsUrl) {
       try {
-        wsUrl = await browserWs(meta.port);
-        if (wsUrl) port = meta.port;
+        const lines = fs
+          .readFileSync(path.join(store.profileDir(id), 'DevToolsActivePort'), 'utf8')
+          .split('\n')
+          .map((s) => s.trim());
+        const activePort = parseInt(lines[0], 10) || 0;
+        if (activePort > 0 && lines[1]) {
+          wsUrl = validDevToolsEndpoint('ws://127.0.0.1:' + activePort + lines[1], activePort);
+          if (wsUrl) port = activePort;
+        }
       } catch {
-        /* 进程已经没了 */
+        /* older fixed-port profiles may not have DevToolsActivePort */
       }
+    }
+    if (!wsUrl && expectedPort) {
+      wsUrl = devToolsEndpoint(path.join(store.DATA, 'logs', id + '.log'), 0, expectedPort);
+      if (wsUrl) port = expectedPort;
     }
     if (!wsUrl) {
       forget(id);
@@ -755,6 +840,7 @@ async function reattach() {
         chromePath: meta.chromePath || '',
         cdp,
         port,
+        wsUrl,
         browserVersion: fullVersion,
         sessions: new Map(),
         scripted: new Set(),
@@ -832,6 +918,7 @@ async function launch(profileId, options = {}) {
       '没找到 Chromium 内核浏览器。装 Chrome/Edge，或用 FB_BROWSER 环境变量指定 chrome.exe 路径'
     );
   }
+  assertProfileConfig(profile);
 
   let proxy = profile.proxy || {};
   let useProxy = proxy.type !== 'none' && proxy.host && proxy.port;
@@ -937,20 +1024,25 @@ async function launch(profileId, options = {}) {
     /* 日志不存在或截断失败不影响启动 */
   }
   const logFd = fs.openSync(logPath, 'a');
-  const proc = spawn(chromePath, args, {
-    stdio: ['ignore', 'ignore', logFd],
-    // detached：浏览器不跟控制台绑在一起（控制台崩了它还能活着，下次启动时接管回来），
-    // 在 POSIX 上还顺带让它成为进程组头，stop() 才能整组杀掉
-    detached: true,
-    windowsHide: false,
-  });
-  proc.on('error', (e) => {
+  let started;
+  try {
+    started = await spawnBrowserWithPortRetry(chromePath, args, logPath, logFd, debugPort);
+  } catch (e) {
     try {
-      fs.appendFileSync(logPath, '\n[spawn error] ' + e.message + '\n');
+      fs.closeSync(logFd);
     } catch {
       /* ignore */
     }
-  });
+    if (relay) {
+      try {
+        await relay.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    throw e;
+  }
+  const { proc, port, devtools } = started;
 
   const instance = {
     profileId,
@@ -960,7 +1052,8 @@ async function launch(profileId, options = {}) {
     logPath,
     chromePath,
     cdp: null,
-    port: 0,
+    port,
+    wsUrl: devtools.wsUrl,
     browserVersion: '',
     sessions: new Map(),
     scripted: new Set(), // 已经挂过注入脚本的 targetId（Node 侧幂等，页面里不留标记）
@@ -972,9 +1065,7 @@ async function launch(profileId, options = {}) {
 
   try {
     /* 4. 连上 DevTools */
-    const { port, wsUrl } = await waitForDevTools(userDataDir, proc, 25000, debugPort);
-    instance.port = port;
-    const cdp = await CDP.connect(wsUrl);
+    const cdp = await CDP.connect(devtools.wsUrl);
     instance.cdp = cdp;
     // 先登记再接管：万一后面某步抛错，stop() 能把登记一起清掉
     remember(instance);
@@ -986,6 +1077,7 @@ async function launch(profileId, options = {}) {
     const ver = await cdp.send('Browser.getVersion');
     const product = ver.product || '';
     const fullVersion = (product.split('/')[1] || '141.0.0.0').trim();
+    assertProfileConfig(profile, fullVersion);
     instance.browserVersion = fullVersion;
 
     // 必须在任何 setUserAgentOverride 之前读，否则读到的是我们自己伪造的值
@@ -1421,23 +1513,31 @@ async function withCookieCdp(profileId, fn) {
   const userDataDir = store.profileDir(profileId);
   fs.mkdirSync(userDataDir, { recursive: true });
   const port = await freePort();
-  const proc = spawn(
-    chromePath,
-    [
-      '--headless=new',
-      '--user-data-dir=' + userDataDir,
-      '--remote-debugging-port=' + port,
-      '--remote-debugging-address=127.0.0.1',
-      '--no-first-run',
-      '--no-default-browser-check',
-      'about:blank',
-    ],
-    { stdio: 'ignore', windowsHide: true }
-  );
-
+  const logDir = path.join(store.DATA, 'logs');
+  fs.mkdirSync(logDir, { recursive: true });
+  const logPath = path.join(logDir, profileId + '.log');
+  const logFd = fs.openSync(logPath, 'a');
+  const logOffset = fs.fstatSync(logFd).size;
+  let proc = null;
   let cdp = null;
   try {
-    const { wsUrl } = await waitForDevTools(userDataDir, proc, 15000, port);
+    proc = spawn(
+      chromePath,
+      [
+        '--headless=new',
+        '--user-data-dir=' + userDataDir,
+        '--remote-debugging-port=' + port,
+        '--remote-debugging-address=127.0.0.1',
+        '--no-first-run',
+        '--no-default-browser-check',
+        'about:blank',
+      ],
+      { stdio: ['ignore', 'ignore', logFd], windowsHide: true }
+    );
+    proc.on('error', (e) => {
+      try { fs.appendFileSync(logPath, '\n[cookie browser spawn error] ' + e.message + '\n'); } catch {}
+    });
+    const { wsUrl } = await waitForDevTools(proc, 15000, port, logPath, logOffset);
     cdp = await CDP.connect(wsUrl, 8000);
     return await fn(cdp);
   } finally {
@@ -1445,18 +1545,21 @@ async function withCookieCdp(profileId, fn) {
       await cdp.try_('Browser.close');
       cdp.close();
     }
-    await new Promise((resolve) => {
-      if (proc.exitCode !== null) return resolve();
-      const timer = setTimeout(resolve, 3000);
-      proc.once('exit', () => {
-        clearTimeout(timer);
-        resolve();
+    if (proc) {
+      await new Promise((resolve) => {
+        if (proc.exitCode !== null) return resolve();
+        const timer = setTimeout(resolve, 3000);
+        proc.once('exit', () => {
+          clearTimeout(timer);
+          resolve();
+        });
       });
-    });
-    if (proc.exitCode === null && proc.pid) {
-      await killTree(proc.pid);
+      if (proc.exitCode === null && proc.pid) {
+        await killTree(proc.pid);
+      }
+      await sleep(150);
     }
-    await sleep(150);
+    try { fs.closeSync(logFd); } catch {}
   }
 }
 
