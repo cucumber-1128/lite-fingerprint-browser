@@ -177,7 +177,14 @@ input[type="checkbox"] { width: auto; }
 .card.selected { border-color: var(--accent-2); box-shadow: 0 0 0 1px var(--accent-2) inset; }
 .card-check { cursor: pointer; margin: 0; flex-shrink: 0; }
 .meta .note { color: #a5b4fc; }
-.meta .warning { color: #fbbf24; }
+.meta .warning {
+  color: #fbbf24;
+  min-width: 0;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
 .health-ok { color: var(--accent); font-weight: 600; }
 .health-bad { color: var(--danger); font-weight: 600; }
 .health-sep { grid-column: 1 / -1; border-top: 1px solid var(--line); margin: 6px 0; }
